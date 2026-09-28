@@ -1,0 +1,51 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $channelLine = Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$' | Select-Object -First 1
+          if (!$channelLine) { throw 'rust-toolchain.toml does not declare a toolchain channel' }
+          $channel = $channelLine.Matches[0].Groups[1].Value
+          rustup toolchain install $channel --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the active Rust toolchain' }
+
+      - name: Build Windows ZIP
+        id: package
+        run: ./tools/package-windows.ps1 -Mode Headless
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Switchmut-windows
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 14

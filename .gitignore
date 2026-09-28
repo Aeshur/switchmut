@@ -1,0 +1,13 @@
+# Build and release output
+/target/
+/release/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.log
+
+# Editor state
+/.vs/
+/.vscode/
+/.idea/

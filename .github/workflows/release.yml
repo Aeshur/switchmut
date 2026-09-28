@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Release (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $channelLine = Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$' | Select-Object -First 1
+          if (!$channelLine) { throw 'rust-toolchain.toml does not declare a toolchain channel' }
+          $channel = $channelLine.Matches[0].Groups[1].Value
+          rustup toolchain install $channel --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the active Rust toolchain' }
+
+      - name: Validate tag against Cargo version
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+          $packages = @($metadata.packages | Where-Object { $_.name -ceq 'switchmut' })
+          if ($packages.Count -ne 1) { throw "Expected one switchmut package, found $($packages.Count)" }
+          $expectedTag = "v$($packages[0].version)"
+          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
+            throw "Release tag '$env:GITHUB_REF_NAME' must exactly match Cargo version tag '$expectedTag'"
+          }
+
+      - name: Build Windows ZIP
+        id: package
+        run: ./tools/package-windows.ps1 -Mode Interactive -NativeChecks
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Switchmut-windows
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.manifest }}
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: Switchmut-windows
+          path: release-assets
+
+      - name: Create release and upload packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $expectedFiles = @('Switchmut-release-manifest.json', 'Switchmut-windows.zip')
+          $actualFiles = @(Get-ChildItem -LiteralPath 'release-assets' -Name | Sort-Object)
+          if (Compare-Object $expectedFiles $actualFiles -CaseSensitive) {
+            throw 'The release artifact does not contain the expected ZIP and manifest'
+          }
+
+          $manifestFile = Get-Item -LiteralPath 'release-assets/Switchmut-release-manifest.json'
+          $zipFile = Get-Item -LiteralPath 'release-assets/Switchmut-windows.zip'
+          $report = Get-Content -LiteralPath $manifestFile.FullName -Raw | ConvertFrom-Json
+          if ($tag -cne "v$($report.Version)") { throw "Tag '$tag' does not match manifest version '$($report.Version)'" }
+          if ($report.Source.Dirty) { throw 'The release source tree was dirty' }
+          if ($report.Source.Commit -cne $env:GITHUB_SHA) { throw 'The release source commit does not match the tagged workflow commit' }
+          if ($report.Validation.NativeChecks -ne 'passed') { throw 'Native checks were not passed for this candidate' }
+          if ($report.Validation.ExtractedApplicationSmoke -ne 'passed') { throw 'Extracted application smoke was not passed for this candidate' }
+          $releaseArchiveName = 'Switchmut-windows.zip'
+          if ([IO.Path]::GetFileName($report.Archive) -cne $releaseArchiveName) { throw 'ZIP filename does not match the manifest' }
+
+          $zipHash = (Get-FileHash -LiteralPath $zipFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($zipHash -cne $report.ArchiveSha256.ToLowerInvariant()) { throw 'Downloaded ZIP hash does not match the manifest' }
+          $manifestHash = (Get-FileHash -LiteralPath $manifestFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          $releaseManifestName = 'Switchmut-release-manifest.json'
+          $releaseZip = $zipFile.FullName
+          $releaseManifest = $manifestFile.FullName
+          $assets = @(
+            [pscustomobject]@{ Name = $releaseArchiveName; Path = $releaseZip; Hash = $zipHash }
+            [pscustomobject]@{ Name = $releaseManifestName; Path = $releaseManifest; Hash = $manifestHash }
+          )
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          $release = $null
+          try {
+            $release = Invoke-RestMethod -Uri $releaseUri -Headers $headers
+          }
+          catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+
+          if ($null -eq $release) {
+            gh release create $tag $releaseZip $releaseManifest --verify-tag --title "Switchmut $tag" --generate-notes --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed' }
+          }
+          else {
+            if ($release.tag_name -cne $tag) { throw "GitHub returned unexpected release tag '$($release.tag_name)'" }
+            $missingAssets = @()
+            foreach ($asset in $assets) {
+              $existing = @($release.assets | Where-Object { $_.name -ceq $asset.Name })
+              if ($existing.Count -gt 1) { throw "GitHub release has duplicate asset '$($asset.Name)'" }
+              if ($existing.Count -eq 0) {
+                $missingAssets += $asset.Path
+                continue
+              }
+
+              $existingDir = Join-Path $env:RUNNER_TEMP "existing-$($asset.Name)"
+              New-Item -ItemType Directory -Path $existingDir -Force | Out-Null
+              gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $asset.Name --dir $existingDir
+              if ($LASTEXITCODE -ne 0) { throw "Could not verify existing release asset '$($asset.Name)'" }
+              $existingPath = Join-Path $existingDir $asset.Name
+              if (!(Test-Path -LiteralPath $existingPath -PathType Leaf)) { throw "Existing asset download missing: $($asset.Name)" }
+              $existingHash = (Get-FileHash -LiteralPath $existingPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($existingHash -cne $asset.Hash) { throw "Existing release asset '$($asset.Name)' has different bytes; refusing to replace it" }
+            }
+
+            if ($missingAssets.Count -gt 0) {
+              $uploadArguments = @('release', 'upload', $tag) + $missingAssets + @('--repo', $env:GITHUB_REPOSITORY)
+              gh @uploadArguments
+              if ($LASTEXITCODE -ne 0) { throw 'Uploading missing GitHub release assets failed' }
+            }
+          }
