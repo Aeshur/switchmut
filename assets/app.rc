@@ -14,7 +14,7 @@ BEGIN
   BLOCK "040904B0"
   BEGIN
    VALUE "CompanyName", "Aeshur\0"
-   VALUE "FileDescription", "Switchmut\0"
+   VALUE "FileDescription", "Gamepad client switcher for Final Fantasy XIV 1.23b\0"
    VALUE "FileVersion", "1.0.0.0\0"
    VALUE "InternalName", "Switchmut\0"
    VALUE "OriginalFilename", "Switchmut.exe\0"

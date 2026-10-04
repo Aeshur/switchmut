@@ -44,9 +44,9 @@ impl Rotation {
         }
     }
 
-    /// Reconcile before a next/previous command. Like the source's
-    /// `NoActivateNext` refresh, this leaves the numeric cursor untouched so
-    /// the caller's following `next` performs exactly one advance.
+    /// Reconcile before a next/previous command without advancing the selection.
+    /// Like the source's `NoActivateNext` refresh, preserve the selected client
+    /// when possible and leave the next advance to the caller's `next`.
     pub fn reconcile_for_switch(&mut self, discovered: Vec<Client>) {
         let previous = self.current();
         let previous_index = previous

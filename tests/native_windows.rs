@@ -609,14 +609,14 @@ fn native_lifecycle() {
         assert_eq!(
             initial_client.bottom,
             (420 * dpi as i32 + 95) / 96,
-            "default logical client height is content-fit"
+            "default logical client height fits the content"
         );
         for id in [
             3, 100, 101, 111, 112, 113, 114, 116, 211, 213, 214, 215, 216,
         ] {
             assert!(
                 !unsafe { GetDlgItem(settings_hwnd, id) }.is_null(),
-                "surviving control {id} exists"
+                "control {id} exists"
             );
         }
         for id in [1, 2] {
@@ -697,7 +697,7 @@ fn native_lifecycle() {
         }
         match settings.events.try_recv().unwrap() {
             SettingsEvent::ClientEdits(clients) => {
-                assert!(!clients[0].allowed, "allow change is saved automatically");
+                assert!(!clients[0].allowed, "client edits include the allow change");
             }
             other => panic!("Unexpected allow-change event: {other:?}"),
         }
@@ -706,10 +706,7 @@ fn native_lifecycle() {
         }
         match settings.events.try_recv().unwrap() {
             SettingsEvent::ClientEdits(clients) => {
-                assert_eq!(
-                    clients[0].key, other,
-                    "client reorder is saved automatically"
-                );
+                assert_eq!(clients[0].key, other, "client edits include the new order");
                 assert_eq!(clients[1].key, target_key);
             }
             other => panic!("Unexpected reorder event: {other:?}"),
@@ -933,7 +930,7 @@ fn native_lifecycle() {
             assert_eq!(
                 unsafe { SendMessageW(GetDlgItem(settings_hwnd, 213), LB_GETCOUNT, 0, 0) },
                 3,
-                "Gamepad keeps the three surviving action bindings"
+                "Gamepad shows all three action bindings"
             );
             assert_eq!(
                 logical_top(settings_hwnd, gamepad_status),

@@ -297,7 +297,7 @@ pub fn run() -> Result<(), String> {
         && let Some(settings) = &app.settings
     {
         settings.status(&format!(
-            "Configuration migration/recovery: {}.",
+            "Configuration notices: {}.",
             loaded.warnings.join("; ")
         ));
     }

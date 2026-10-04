@@ -5,8 +5,7 @@
 </p>
 
 <p align="center">
-Compact tool for switching Final Fantasy XIV 1.23b clients with a
-Gamepad.
+Switch between Final Fantasy XIV 1.23b clients on Windows with a gamepad.
 </p>
 
 <p align="center">
@@ -17,22 +16,38 @@ Gamepad.
 ## Portable setup
 
 Extract `Switchmut-windows.zip` and run `Switchmut.exe`. The executable's folder
-must be writable. Select a Gamepad and assign buttons on the Gamepad page.
-Settings save automatically to `config-switchmut.json`. Diagnostics go to
-`log-switchmut.log` beside the executable.
+must be writable.
+
+1. On the Gamepad page, select a controller or leave it set to Automatic.
+2. Select an action, click Assign, then press the gamepad button to use.
+3. Use Switch Next or Switch Previous to change clients. Hold the button assigned
+   to Toggle Menu, move the stick to select an action, then release the button.
+
+The General page lets you refresh the client list, change its order and choose
+which clients are allowed. Client order and Allow / Deny choices are not saved
+between runs. Controller, button and refresh settings save automatically to
+`config-switchmut.json`. Diagnostics go to `log-switchmut.log` beside the
+executable.
+
+Closing the settings window leaves Switchmut running in the tray. Double-click
+the tray icon to reopen settings, or right-click it and choose Exit to quit.
 
 ## Build
 
-Install the pinned Rust toolchain through rustup and Visual Studio C++ Build
-Tools with a Windows SDK:
+On Windows, install rustup, the toolchain pinned in `rust-toolchain.toml`, and
+Visual Studio C++ Build Tools with a Windows SDK. Then run:
 
 ```powershell
 .\tools\package-windows.ps1 -Mode Headless
 ```
 
-Use `-Mode Interactive` for the extracted native tray smoke check on a desktop.
-Add `-NativeChecks` to run the native regression checks. The package ZIP
-contains `Switchmut.exe` only.
+This runs formatting, Clippy and tests, then builds and checks a release package
+under `release/`. The package ZIP contains `Switchmut.exe` only.
+
+Use `-Mode Interactive -NativeChecks` on an interactive Windows desktop to also
+run the native regression tests and check the extracted application. Close any
+running Switchmut instance first. Add `-LiveGameCheck` only when a supported game
+client is running; it checks foreground switching, capture and minimize/restore.
 
 ## Acknowledgement
 

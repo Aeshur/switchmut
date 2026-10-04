@@ -5,7 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// UI-thread-owned writer. Keep at most two 1 MiB logs; never log idle ticks.
+/// Log writer used only by the UI thread. Keeps at most two 1 MiB logs.
+/// Never logs idle ticks.
 pub struct Log {
     path: PathBuf,
 }

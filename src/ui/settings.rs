@@ -296,7 +296,7 @@ impl Settings {
             data.pending_save = None;
             data.show_save_feedback = false;
             data.notice(&format!(
-                "Save failed: {error} Changes remain unapplied; retry."
+                "Save failed: {error} Changes were not applied. Try again."
             ));
         }
     }
@@ -748,8 +748,8 @@ impl State {
         self.update_status_control();
     }
     fn notice(&mut self, text: &str) {
-        // Errors and migration/recovery notices must be visible even when
-        // their source is General. General itself never owns a status line.
+        // Show errors and configuration notices on Gamepad, even when they
+        // come from General, which has no status line.
         self.tab = 1;
         self.scroll = 0;
         self.status(text);

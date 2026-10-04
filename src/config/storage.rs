@@ -87,7 +87,8 @@ pub fn load(path: &Path) -> Result<LoadResult, String> {
     }
 }
 
-/// Saves validated JSON with a same-directory atomic replacement and a `.bak` copy.
+/// Atomically replaces the config with validated JSON in the same directory.
+/// Keeps the previous valid config in a `.bak` file.
 pub fn save(path: &Path, config: &Config) -> Result<(), String> {
     config.validate()?;
     let bytes = serialize_config(config)?;
