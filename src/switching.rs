@@ -1,4 +1,4 @@
-//! Deterministic client ordering and the v2.7 internal selection cursor.
+//! Deterministic client ordering and the internal selection cursor.
 
 use crate::clients::{Client, ClientKey};
 use std::collections::HashMap;
@@ -10,11 +10,9 @@ pub struct Rotation {
 }
 
 impl Rotation {
-    /// Reconcile an ordinary discovery pass. Existing windows keep their
-    /// relative order and allow setting; new windows append in discovery order.
-    /// The legacy monitor started at index zero, then selected the next
-    /// eligible client after initial enumeration. If refresh removes the
-    /// selected window, it advances once from the old numeric cursor.
+    /// Existing windows keep their order and `allowed` flag; new windows append in discovery order.
+    /// Initial discovery starts at zero and advances to the next allowed client.
+    /// Losing the selected window advances once from its old numeric cursor.
     pub fn reconcile(&mut self, discovered: Vec<Client>) {
         let was_empty = self.clients.is_empty();
         let previous = self.current();
@@ -44,9 +42,8 @@ impl Rotation {
         }
     }
 
-    /// Reconcile before a next/previous command without advancing the selection.
-    /// Like the source's `NoActivateNext` refresh, preserve the selected client
-    /// when possible and leave the next advance to the caller's `next`.
+    /// Preserve the selected client or its numeric cursor without advancing.
+    /// The caller's `next` performs the advance.
     pub fn reconcile_for_switch(&mut self, discovered: Vec<Client>) {
         let previous = self.current();
         let previous_index = previous
@@ -122,12 +119,11 @@ impl Rotation {
     }
 
     /// Change whether this client participates in next/previous rotation.
-    pub fn allow(&mut self, key: ClientKey, allowed: bool) -> bool {
+    pub fn allow(&mut self, key: ClientKey, allowed: bool) {
         let Some(client) = self.clients.iter_mut().find(|client| client.key == key) else {
-            return false;
+            return;
         };
         client.allowed = allowed;
-        true
     }
 
     pub fn clients(&self) -> &[Client] {
@@ -168,7 +164,6 @@ mod tests {
                 pid: id as u32 + 100,
                 created: 1,
             },
-            class: format!("Window{id}"),
             title: format!("Client {id}"),
             allowed,
         }
@@ -188,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_enumeration_advances_from_legacy_index_zero() {
+    fn initial_enumeration_advances_from_index_zero() {
         let mut rotation = Rotation::default();
         let first = client(1, true).key;
         let second = client(2, true).key;

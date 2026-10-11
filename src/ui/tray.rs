@@ -7,6 +7,7 @@ use windows_sys::Win32::{
 };
 
 pub const TRAY_MESSAGE: u32 = WM_APP + 1;
+const MENU_ACTIONS: [Action; 2] = [Action::Next, Action::Previous];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayCallback {
@@ -50,12 +51,10 @@ impl Tray {
         }
         Ok(Self { owner, data })
     }
-    pub fn restore(&self) -> Result<(), u32> {
-        if unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) } == 0 {
-            Err(unsafe { GetLastError() })
-        } else {
-            Ok(())
-        }
+    /// Re-add the icon after Explorer restarts. Shell_NotifyIconW reports no
+    /// extended error, so failure carries no code.
+    pub fn restore(&self) -> bool {
+        unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) != 0 }
     }
     pub fn popup(&self) -> Option<TrayCommand> {
         unsafe {
@@ -66,7 +65,7 @@ impl Tray {
             append(root, 1, "&Settings...");
             append(root, 2, "&Refresh clients");
             separator(root);
-            for (i, action) in [Action::Next, Action::Previous].into_iter().enumerate() {
+            for (i, action) in MENU_ACTIONS.into_iter().enumerate() {
                 append(root, 100 + i, action.label());
             }
             separator(root);
@@ -84,14 +83,12 @@ impl Tray {
                 null_mut(),
             ) as usize;
             PostMessageW(self.owner, WM_NULL, 0, 0);
-            DestroyMenu(root); // Also owns and destroys its submenus.
+            DestroyMenu(root);
             match chosen {
                 1 => Some(TrayCommand::Settings),
                 2 => Some(TrayCommand::Refresh),
                 5 => Some(TrayCommand::Exit),
-                100..=101 => Some(TrayCommand::Action(
-                    [Action::Next, Action::Previous][chosen - 100],
-                )),
+                100..=101 => Some(TrayCommand::Action(MENU_ACTIONS[chosen - 100])),
                 _ => None,
             }
         }

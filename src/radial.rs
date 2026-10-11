@@ -6,24 +6,24 @@ use std::sync::OnceLock;
 
 use crate::actions::Action;
 use crate::clients::{ClientKey, is_live};
-use crate::config::{MenuConfig, MenuItem};
 use crate::platform::PaintBuffer;
 use crate::ui::wide;
-use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, CreatePen, CreateSolidBrush, DT_CENTER, DT_VCENTER, DT_WORDBREAK, DeleteObject,
     DrawTextW, Ellipse, FW_BOLD, FillRect, GetStockObject, HDC, InvalidateRect, LineTo, MoveToEx,
     NULL_BRUSH, PS_SOLID, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetClientRect,
     GetWindowLongPtrW, HWND_TOPMOST, IDC_ARROW, KillTimer, LWA_ALPHA, LWA_COLORKEY, LoadCursorW,
     RegisterClassW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SetLayeredWindowAttributes,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SHOWWINDOW, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_ERASEBKGND, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 const CLASS_NAME: &str = "Switchmut.NativeRadial.1";
@@ -44,6 +44,8 @@ const BASE_CIRCLE_RADIUS: i32 = 47;
 const SELECTOR_RADIUS: f64 = 57.0;
 const SELECTOR_HALF_WIDTH: f64 = 10.0;
 static CLASS_REGISTERED: OnceLock<bool> = OnceLock::new();
+/// Radial sectors clockwise from the top.
+const ITEMS: [Action; 2] = [Action::Next, Action::Previous];
 
 struct RadialSlot {
     hwnd: Cell<HWND>,
@@ -52,7 +54,6 @@ struct RadialSlot {
 
 struct RadialWindow {
     source: Option<ClientKey>,
-    items: Vec<MenuItem>,
     selected: Option<usize>,
     direction_degrees: i32,
     is_open: bool,
@@ -63,10 +64,10 @@ struct RadialWindow {
 }
 
 impl RadialSlot {
-    fn new(config: MenuConfig, source: Option<ClientKey>) -> Self {
+    fn new(source: Option<ClientKey>) -> Self {
         Self {
             hwnd: Cell::new(std::ptr::null_mut()),
-            inner: RefCell::new(RadialWindow::new(config, source)),
+            inner: RefCell::new(RadialWindow::new(source)),
         }
     }
 
@@ -84,28 +85,9 @@ impl Drop for RadialSlot {
 }
 
 impl RadialWindow {
-    fn new(config: MenuConfig, source: Option<ClientKey>) -> Self {
-        let items: Vec<MenuItem> = if config.items.is_empty() {
-            Action::ALL
-                .into_iter()
-                .filter(|action| *action != Action::Menu)
-                .map(|action| MenuItem {
-                    action,
-                    label: action.menu_label().to_owned(),
-                    enabled: true,
-                })
-                .collect()
-        } else {
-            config
-                .items
-                .iter()
-                .filter(|item| item.enabled && item.action != Action::Menu)
-                .cloned()
-                .collect()
-        };
+    fn new(source: Option<ClientKey>) -> Self {
         Self {
             source,
-            items,
             selected: None,
             direction_degrees: 270,
             is_open: false,
@@ -117,6 +99,8 @@ impl RadialWindow {
     }
 
     fn ensure_window(&mut self, owner: &RadialSlot) -> bool {
+        // A second window would overwrite the slot's HWND and leave the first
+        // pointing at this slot after it is freed.
         if !owner.hwnd.get().is_null() {
             return true;
         }
@@ -181,24 +165,12 @@ impl RadialWindow {
             return false;
         }
         self.is_open = true;
-        self.selected = None;
-        self.previous_selection = None;
-        self.animation_step = 0;
         let hwnd = owner.hwnd.get();
         let timer = unsafe { SetTimer(hwnd, TIMER_ID, MENU_REDRAW_INTERVAL_MS, None) };
         if timer == 0 {
             self.record_error("could not start the radial menu redraw timer");
         }
         unsafe {
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                MENU_POSITION_X,
-                MENU_POSITION_Y,
-                MENU_WIDTH,
-                MENU_HEIGHT,
-                SWP_NOACTIVATE,
-            );
             ShowWindow(hwnd, SW_SHOW);
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
@@ -225,7 +197,7 @@ impl RadialWindow {
             self.close(owner);
             return;
         }
-        let selected = select_sector(x, y, self.items.len());
+        let selected = select_sector(x, y, ITEMS.len());
         if selected != self.selected {
             self.animation_step = 0;
             self.previous_selection = self.selected;
@@ -238,8 +210,8 @@ impl RadialWindow {
             }
         }
         if self.selected.is_some() {
-            let dx = x.clamp(0, 65_535) - 32_767;
-            let dy = y.clamp(0, 65_535) - 32_767;
+            let dx = x - 32_767;
+            let dy = y - 32_767;
             self.direction_degrees = (dy as f64).atan2(dx as f64).to_degrees() as i32;
             self.direction_degrees = self.direction_degrees.rem_euclid(360);
         }
@@ -250,9 +222,7 @@ impl RadialWindow {
     }
 
     fn selected_action(&self) -> Option<Action> {
-        self.selected
-            .and_then(|index| self.items.get(index))
-            .map(|item| item.action)
+        self.selected.and_then(|index| ITEMS.get(index).copied())
     }
 
     fn draw(&mut self, owner: &RadialSlot, dc: HDC) {
@@ -281,9 +251,9 @@ impl RadialWindow {
         }
         let cx = (client.right - client.left) / 2;
         let cy = (client.bottom - client.top) / 2;
-        let base_color = composite_color(MENU_BASE_COLOR, MENU_BACKGROUND);
-        let selector_color = composite_color(MENU_SELECTOR_COLOR, MENU_BACKGROUND);
-        let text_color = composite_color(MENU_TEXT_COLOR, MENU_BACKGROUND);
+        let base_color = colorref(MENU_BASE_COLOR);
+        let selector_color = colorref(MENU_SELECTOR_COLOR);
+        let text_color = colorref(MENU_TEXT_COLOR);
         let base_pen = unsafe { CreatePen(PS_SOLID, 1, base_color) };
         let selector_pen = unsafe { CreatePen(PS_SOLID, 2, selector_color) };
         let base_circle_pen = unsafe { CreatePen(PS_SOLID, 8, base_color) };
@@ -344,8 +314,8 @@ impl RadialWindow {
                 cy + BASE_CIRCLE_RADIUS,
             );
         }
-        for (index, item) in self.items.iter().enumerate() {
-            let step = 360.0 / self.items.len() as f64;
+        for (index, action) in ITEMS.into_iter().enumerate() {
+            let step = 360.0 / ITEMS.len() as f64;
             let radians = (step * index as f64 - 90.0).to_radians();
             let mut radial = ICON_RADIUS;
             if self.previous_selection == Some(index) && self.selected != Some(index) {
@@ -356,14 +326,10 @@ impl RadialWindow {
             }
             let x = cx + (radians.cos() * radial).round() as i32;
             let y = cy + (radians.sin() * radial).round() as i32;
-            unsafe { SetTextColor(dc, base_color) };
-            unsafe { draw_icon(dc, item.action, x, y) };
+            unsafe { draw_icon(dc, action, x, y) };
         }
-        if let Some(index) = self
-            .selected
-            .and_then(|index| self.items.get(index).map(|_| index))
-        {
-            let mut text = wide(&self.items[index].label);
+        if let Some(action) = self.selected_action() {
+            let mut text = wide(action.menu_label());
             let mut bounds = RECT {
                 left: cx - 42,
                 top: cy - 42,
@@ -371,7 +337,6 @@ impl RadialWindow {
                 bottom: cy + 42,
             };
             unsafe {
-                SetTextColor(dc, text_color);
                 let text_result = DrawTextW(
                     dc,
                     text.as_mut_ptr(),
@@ -379,7 +344,6 @@ impl RadialWindow {
                     &mut bounds,
                     DT_CENTER | DT_VCENTER | DT_WORDBREAK,
                 );
-                SetTextColor(dc, text_color);
                 if text_result == 0 {
                     draw_failed = true;
                     self.record_error("could not draw the radial menu label");
@@ -463,9 +427,9 @@ pub struct Radial {
 }
 
 impl Radial {
-    pub fn new(config: MenuConfig, source: Option<ClientKey>) -> Self {
+    pub fn new(source: Option<ClientKey>) -> Self {
         Self {
-            window: Box::new(RadialSlot::new(config, source)),
+            window: Box::new(RadialSlot::new(source)),
         }
     }
 
@@ -515,11 +479,8 @@ impl Radial {
 }
 
 fn select_sector(x: i32, y: i32, item_count: usize) -> Option<usize> {
-    if item_count == 0 || item_count > 360 {
-        return None;
-    }
-    let dx = x.clamp(0, 65_535) - 32_767;
-    let dy = y.clamp(0, 65_535) - 32_767;
+    let dx = x - 32_767;
+    let dy = y - 32_767;
     if ((i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)) as f64).sqrt()
         <= f64::from(MENU_SENSITIVITY)
     {
@@ -537,19 +498,6 @@ fn colorref(argb: u32) -> u32 {
     let green = (argb >> 8) & 0xff;
     let blue = argb & 0xff;
     red | (green << 8) | (blue << 16)
-}
-
-// The menu has a solid form background. GDI pens/text use the component color
-// composited over that surface; whole-window opacity is applied separately.
-fn composite_color(argb: u32, background: u32) -> u32 {
-    let alpha = argb >> 24;
-    let mut rgb = 0;
-    for shift in [0, 8, 16] {
-        let foreground = (argb >> shift) & 255;
-        let behind = (background >> shift) & 255;
-        rgb |= ((foreground * alpha + behind * (255 - alpha) + 127) / 255) << shift;
-    }
-    colorref(rgb)
 }
 
 fn draw_selector(dc: HDC, cx: i32, cy: i32, direction_degrees: f64) {
@@ -599,7 +547,7 @@ fn register_class() -> bool {
         let mut name = wide(CLASS_NAME);
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let class = WNDCLASSW {
-            style: CS_DBLCLKS,
+            style: 0,
             lpfnWndProc: Some(window_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -611,7 +559,7 @@ fn register_class() -> bool {
             lpszClassName: name.as_mut_ptr(),
         };
         let atom = unsafe { RegisterClassW(&class) };
-        atom != 0 || unsafe { GetLastError() } == 1410
+        atom != 0 || unsafe { GetLastError() } == ERROR_CLASS_ALREADY_EXISTS
     })
 }
 
@@ -682,23 +630,12 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     };
     match message {
-        WM_SHOWWINDOW => {
-            state.is_open = wparam != 0;
-            if wparam == 0 {
-                unsafe { KillTimer(hwnd, TIMER_ID) };
-            }
-            0
-        }
         WM_TIMER => {
             if state.animation_step < 20 {
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             } else {
                 unsafe { KillTimer(hwnd, TIMER_ID) };
             }
-            0
-        }
-        WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
-            state.close(slot);
             0
         }
         WM_CLOSE => {
@@ -717,27 +654,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn argb_component_alpha_composites_over_menu_background() {
-        assert_eq!(
-            composite_color(0x00ffffff, 0xff102030),
-            colorref(0xff102030)
-        );
-        assert_eq!(
-            composite_color(0xffffffff, 0xff102030),
-            colorref(0xffffffff)
-        );
-        assert_eq!(
-            composite_color(0x80ffffff, 0xff000000),
-            colorref(0xff808080)
-        );
-    }
-
-    fn menu_item(action: Action, label: &str, enabled: bool) -> MenuItem {
-        MenuItem {
-            action,
-            label: label.to_owned(),
-            enabled,
-        }
+    fn argb_constants_convert_to_gdi_colorref_order() {
+        assert_eq!(colorref(0xff10_2030), 0x0030_2010);
     }
 
     #[test]
@@ -749,72 +667,19 @@ mod tests {
     }
 
     #[test]
-    fn center_and_disabled_items_do_not_release_actions() {
-        assert_eq!(select_sector(32_767, 32_767, 5), None);
-        let menu = RadialWindow::new(
-            MenuConfig {
-                items: vec![menu_item(Action::Next, "Next", false)],
-            },
-            None,
-        );
-        assert!(menu.items.is_empty());
-        assert_eq!(menu.selected_action(), None);
-    }
-
-    #[test]
-    fn enabled_custom_items_keep_order_and_disabled_items_take_no_sector() {
-        let mut window = RadialWindow::new(
-            MenuConfig {
-                items: vec![
-                    menu_item(Action::Previous, "Back", true),
-                    menu_item(Action::Next, "Disabled", false),
-                    menu_item(Action::Menu, "Menu", true),
-                ],
-            },
-            None,
-        );
-        assert_eq!(
-            window
-                .items
-                .iter()
-                .map(|item| item.action)
-                .collect::<Vec<_>>(),
-            [Action::Previous]
-        );
-        assert_eq!(select_sector(32_767, 20_000, window.items.len()), Some(0));
-        window.selected = Some(0);
-        assert_eq!(window.selected_action(), Some(Action::Previous));
-        window.selected = None;
+    fn centered_stick_selects_nothing_and_sectors_map_to_fixed_actions() {
+        assert_eq!(select_sector(32_767, 32_767, ITEMS.len()), None);
+        let mut window = RadialWindow::new(None);
         assert_eq!(window.selected_action(), None);
-    }
-
-    #[test]
-    fn only_an_empty_custom_list_uses_the_builtin_items() {
-        let mut default = RadialWindow::new(MenuConfig { items: Vec::new() }, None);
-        let disabled = RadialWindow::new(
-            MenuConfig {
-                items: vec![menu_item(Action::Next, "Disabled", false)],
-            },
-            None,
-        );
-        assert_eq!(
-            default
-                .items
-                .iter()
-                .map(|item| item.action)
-                .collect::<Vec<_>>(),
-            [Action::Next, Action::Previous]
-        );
-        default.selected = Some(0);
-        assert_eq!(default.selected_action(), Some(Action::Next));
-        default.selected = Some(1);
-        assert_eq!(default.selected_action(), Some(Action::Previous));
-        assert!(disabled.items.is_empty());
+        window.selected = select_sector(32_767, 20_000, ITEMS.len());
+        assert_eq!(window.selected_action(), Some(Action::Next));
+        window.selected = select_sector(32_767, 45_000, ITEMS.len());
+        assert_eq!(window.selected_action(), Some(Action::Previous));
     }
 
     #[test]
     fn diagnostics_remain_deduplicated_until_a_successful_frame() {
-        let slot = RadialSlot::new(menu_config(), None);
+        let slot = RadialSlot::new(None);
         {
             let mut window = slot.inner.borrow_mut();
             window.record_error("could not create the radial menu window");
@@ -836,9 +701,5 @@ mod tests {
             slot.take_diagnostic().as_deref(),
             Some("could not create the radial menu window")
         );
-    }
-
-    fn menu_config() -> MenuConfig {
-        MenuConfig { items: Vec::new() }
     }
 }

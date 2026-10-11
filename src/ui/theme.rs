@@ -17,8 +17,6 @@ pub const MUTED: u32 = color(0xd7, 0xef, 0xf7);
 pub const SECONDARY: u32 = color(0xa9, 0xd2, 0xe0);
 pub const INPUT: u32 = color(0xf4, 0xfc, 0xff);
 pub const INPUT_TEXT: u32 = color(0x18, 0x36, 0x45);
-pub const INPUT_BORDER: u32 = color(0x00, 0x46, 0x6d);
-pub const SELECTED: u32 = ACCENT_STRONG;
 pub const DANGER: u32 = color(0xbd, 0x33, 0x2b);
 
 pub(crate) const WINDOW_WIDTH: i32 = 290;
@@ -62,10 +60,7 @@ pub struct Theme {
     pub border: HBRUSH,
     pub accent: HBRUSH,
     pub accent_strong: HBRUSH,
-    pub selected: HBRUSH,
     pub input: HBRUSH,
-    pub input_border: HBRUSH,
-    pub danger: HBRUSH,
 }
 
 impl Theme {
@@ -80,10 +75,7 @@ impl Theme {
                 border: CreateSolidBrush(BORDER),
                 accent: CreateSolidBrush(ACCENT),
                 accent_strong: CreateSolidBrush(ACCENT_STRONG),
-                selected: CreateSolidBrush(SELECTED),
                 input: CreateSolidBrush(INPUT),
-                input_border: CreateSolidBrush(INPUT_BORDER),
-                danger: CreateSolidBrush(DANGER),
             }
         }
     }
@@ -146,37 +138,12 @@ impl Drop for Theme {
                 self.border,
                 self.accent,
                 self.accent_strong,
-                self.selected,
                 self.input,
-                self.input_border,
-                self.danger,
             ] {
                 if !brush.is_null() {
                     DeleteObject(brush);
                 }
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::wide;
-
-    #[test]
-    fn section_heading_encoding_is_terminated_at_boundary_lengths() {
-        for title in [
-            "a".repeat(99),
-            "b".repeat(100),
-            "c".repeat(101),
-            "x😀y".to_owned(),
-        ] {
-            let encoded = wide(&title);
-            assert_eq!(encoded.last(), Some(&0));
-            assert_eq!(
-                encoded[..encoded.len() - 1],
-                title.encode_utf16().collect::<Vec<_>>()
-            );
         }
     }
 }

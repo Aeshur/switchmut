@@ -8,9 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 use switchmut::{
-    config::{self, Config},
-    platform::wide,
-    ui::tray::TRAY_MESSAGE,
+    config::{self, Config, RefreshMode},
+    ui::{tray::TRAY_MESSAGE, wide},
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM},
@@ -33,6 +32,18 @@ impl Drop for ExtractedIcons {
             }
             if !self.small.is_null() {
                 DestroyIcon(self.small);
+            }
+        }
+    }
+}
+
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            // Child::kill targets the child handle even before its owner window exists.
+            if self.0.kill().is_ok() {
+                let _ = self.0.wait();
             }
         }
     }
@@ -154,34 +165,25 @@ fn main() -> Result<(), String> {
     }
     let configuration = Config::default();
     config::save(&path, &configuration)?;
-    let mut child = std::process::Command::new(&executable)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let pid = child.id();
+    let mut child = ChildGuard(
+        std::process::Command::new(&executable)
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let pid = child.0.id();
     if !wait_until(|| owner(pid).is_some()) {
         return Err("Packaged app did not create its native owner window".into());
     }
     let hwnd = owner(pid).unwrap();
-    struct Close(HWND, u32);
-    impl Drop for Close {
-        fn drop(&mut self) {
-            unsafe {
-                let mut pid = 0;
-                GetWindowThreadProcessId(self.0, &mut pid);
-                if pid == self.1 {
-                    PostMessageW(self.0, WM_CLOSE, 0, 0);
-                }
-            }
-        }
-    }
-    let _close = Close(hwnd, pid);
     if !wait_until(|| log_count(&log_path, "message loop running") != 0) {
         return Err("Packaged app did not finish tray initialization".into());
     }
-    let mut duplicate = std::process::Command::new(&executable)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    if !wait_until(|| duplicate.try_wait().ok().flatten().is_some()) {
+    let mut duplicate = ChildGuard(
+        std::process::Command::new(&executable)
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    if !wait_until(|| duplicate.0.try_wait().ok().flatten().is_some()) {
         return Err("Duplicate instance did not exit".into());
     }
     assert!(owner(pid).is_some());
@@ -356,7 +358,7 @@ fn main() -> Result<(), String> {
     if !wait_until(|| log_count(&log_path, "tray command selected: Exit") > exit_selections) {
         return Err("The native tray menu did not select Exit".into());
     }
-    if !wait_until(|| child.try_wait().ok().flatten().is_some()) {
+    if !wait_until(|| child.0.try_wait().ok().flatten().is_some()) {
         return Err("Selecting Exit from the tray context menu did not stop the app".into());
     }
     let loaded = config::load(&path)?;
@@ -367,7 +369,7 @@ fn main() -> Result<(), String> {
     }
 
     let mut retained = configuration.clone();
-    retained.refresh_interval_ms = 2345;
+    retained.refresh_mode = RefreshMode::Periodic;
     config::save(&path, &retained)?;
     // A backup is the previous valid file, so save the retained settings once
     // more before corrupting the primary file used for recovery.
@@ -394,22 +396,23 @@ fn main() -> Result<(), String> {
         moved_backup_path.exists(),
         "Config backup is beside the moved executable"
     );
-    let mut moved_child = std::process::Command::new(&moved_executable)
-        .current_dir(&output_directory)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let moved_pid = moved_child.id();
+    let mut moved_child = ChildGuard(
+        std::process::Command::new(&moved_executable)
+            .current_dir(&output_directory)
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let moved_pid = moved_child.0.id();
     if !wait_until(|| owner(moved_pid).is_some()) {
         return Err("Moved packaged app did not create its native owner window".into());
     }
-    let _close_moved = Close(owner(moved_pid).unwrap(), moved_pid);
     if !wait_until(|| log_count(&moved_log_path, "loaded the backup") != 0) {
         return Err(
             "Moved packaged app did not recover its malformed config from the backup".into(),
         );
     }
     let moved_loaded = config::load(&moved_path)?;
-    assert_eq!(moved_loaded.config.refresh_interval_ms, 2345);
+    assert_eq!(moved_loaded.config.refresh_mode, RefreshMode::Periodic);
     assert_eq!(
         std::fs::read(&moved_path).map_err(|error| error.to_string())?,
         malformed
@@ -417,39 +420,41 @@ fn main() -> Result<(), String> {
     unsafe {
         PostMessageW(owner(moved_pid).unwrap(), WM_CLOSE, 0, 0);
     }
-    if !wait_until(|| moved_child.try_wait().ok().flatten().is_some()) {
+    if !wait_until(|| moved_child.0.try_wait().ok().flatten().is_some()) {
         return Err("Moved packaged app did not shut down normally".into());
     }
     std::fs::write(&moved_log_path, vec![b'x'; 1_048_576]).map_err(|error| error.to_string())?;
-    let mut rotated_child = std::process::Command::new(&moved_executable)
-        .current_dir(&output_directory)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let rotated_pid = rotated_child.id();
+    let mut rotated_child = ChildGuard(
+        std::process::Command::new(&moved_executable)
+            .current_dir(&output_directory)
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let rotated_pid = rotated_child.0.id();
     if !wait_until(|| owner(rotated_pid).is_some()) {
         return Err("Moved app did not restart after log rotation setup".into());
     }
-    let _close_rotated = Close(owner(rotated_pid).unwrap(), rotated_pid);
     if !wait_until(|| moved_directory.join("log-switchmut.previous.log").exists()) {
         return Err("Portable log did not rotate beside the executable".into());
     }
     unsafe {
         PostMessageW(owner(rotated_pid).unwrap(), WM_CLOSE, 0, 0);
     }
-    if !wait_until(|| rotated_child.try_wait().ok().flatten().is_some()) {
+    if !wait_until(|| rotated_child.0.try_wait().ok().flatten().is_some()) {
         return Err("Rotated moved app did not shut down normally".into());
     }
 
     let shutdowns = log_count(&log_path, "shutdown: controller worker stopped");
-    let mut close_child = std::process::Command::new(&executable)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let close_pid = close_child.id();
+    let mut close_child = ChildGuard(
+        std::process::Command::new(&executable)
+            .spawn()
+            .map_err(|e| e.to_string())?,
+    );
+    let close_pid = close_child.0.id();
     if !wait_until(|| owner(close_pid).is_some()) {
         return Err("Second packaged app did not create its native owner window".into());
     }
     let close_hwnd = owner(close_pid).unwrap();
-    let _close_active_menu = Close(close_hwnd, close_pid);
     if !wait_until(|| log_count(&log_path, "message loop running") > 1) {
         return Err("Second packaged app did not finish tray initialization".into());
     }
@@ -460,7 +465,7 @@ fn main() -> Result<(), String> {
     unsafe {
         SendMessageW(close_hwnd, WM_CLOSE, 0, 0);
     }
-    if !wait_until(|| close_child.try_wait().ok().flatten().is_some()) {
+    if !wait_until(|| close_child.0.try_wait().ok().flatten().is_some()) {
         return Err("WM_CLOSE did not exit the app while its tray menu was active".into());
     }
     if log_count(&log_path, "shutdown: controller worker stopped") <= shutdowns {

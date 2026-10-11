@@ -25,7 +25,7 @@ must be writable.
 
 The General page lets you refresh the client list, change its order and choose
 which clients are allowed. Client order and Allow / Deny choices are not saved
-between runs. Controller, button and refresh settings save automatically to
+between runs. Controller, button and refresh-mode settings save automatically to
 `config-switchmut.json`. Diagnostics go to `log-switchmut.log` beside the
 executable.
 
@@ -38,20 +38,21 @@ On Windows, install rustup, the toolchain pinned in `rust-toolchain.toml`, and
 Visual Studio C++ Build Tools with a Windows SDK. Then run:
 
 ```powershell
-.\tools\package-windows.ps1 -Mode Headless
+.\tools\package-windows.ps1
 ```
 
 This runs formatting, Clippy and tests, then builds and checks a release package
-under `release/`. The package ZIP contains `Switchmut.exe` only.
+under `release/`. The package ZIP contains `Switchmut.exe`, `LICENSE.txt` and
+`THIRD-PARTY-NOTICES.txt`.
 
-Use `-Mode Interactive -NativeChecks` on an interactive Windows desktop to also
+Use `-Interactive` on an interactive Windows desktop to also
 run the native regression tests and check the extracted application. Close any
 running Switchmut instance first. Add `-LiveGameCheck` only when a supported game
 client is running; it checks foreground switching, capture and minimize/restore.
 
 ## Acknowledgement
 
-FFXI Switchmon
+Switchmut was built using FFXI SwitchMon as its reference.
 
 ## License
 

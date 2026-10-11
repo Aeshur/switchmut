@@ -26,6 +26,22 @@ use windows_sys::{
     core::w,
 };
 
+const ID_REFRESH: i32 = 3;
+const ID_MINIMIZE: i32 = 5;
+const ID_CLOSE: i32 = 6;
+const ID_GENERAL_TAB: i32 = 100;
+const ID_GAMEPAD_TAB: i32 = 101;
+const ID_CLIENTS: i32 = 111;
+const ID_MOVE_UP: i32 = 112;
+const ID_MOVE_DOWN: i32 = 113;
+const ID_TOGGLE_ALLOWED: i32 = 114;
+const ID_REFRESH_MODE: i32 = 116;
+const ID_CONTROLLER: i32 = 211;
+const ID_BINDINGS: i32 = 213;
+const ID_ASSIGN: i32 = 214;
+const ID_UNASSIGN: i32 = 215;
+const ID_CANCEL_CAPTURE: i32 = 216;
+
 const DEFERRED_MINIMIZE: u32 = WM_APP + 0x51;
 const SETTINGS_WINDOW_STYLE: u32 =
     WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL | WS_CLIPCHILDREN;
@@ -78,7 +94,6 @@ pub enum SettingsEvent {
     Save {
         request_id: u64,
         config: Box<Config>,
-        clients: Vec<Client>,
     },
     ClientEdits(Vec<Client>),
     Cancel,
@@ -103,7 +118,6 @@ struct State {
     controls: HashMap<i32, Control>,
     font: HFONT,
     section_font: HFONT,
-    title_font: HFONT,
     theme: theme::Theme,
     dpi: u32,
     tab: i32,
@@ -152,7 +166,6 @@ impl Settings {
                 controls: HashMap::new(),
                 font: null_mut(),
                 section_font: null_mut(),
-                title_font: null_mut(),
                 theme: theme::Theme::new(),
                 dpi: 96,
                 tab: 0,
@@ -253,17 +266,10 @@ impl Settings {
         } else {
             data.draft.bindings.set(action, Some(button));
             data.refresh_bindings(index);
-            match data.emit_save() {
-                Ok(()) => data.status("Saving button assignment..."),
-                Err(error) => data.notice(&error),
-            }
+            data.emit_save();
+            data.status("Saving button assignment...");
         }
         true
-    }
-    pub fn cancel_capture(&self, _reason: &str) {
-        let mut data = self.state.borrow_mut();
-        data.capturing = None;
-        data.clear_status();
     }
     pub fn update_clients(&self, clients: &[Client], current: Option<ClientKey>) {
         let mut data = self.state.borrow_mut();
@@ -326,10 +332,6 @@ impl Drop for Settings {
             if !section_font.is_null() {
                 DeleteObject(section_font);
             }
-            let title_font = self.state.borrow().title_font;
-            if !title_font.is_null() {
-                DeleteObject(title_font);
-            }
         }
     }
 }
@@ -360,7 +362,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     x: (lp as u32 as i16) as i32,
                     y: ((lp as u32 >> 16) as i16) as i32,
                 };
-                for id in [5, 6] {
+                for id in [ID_MINIMIZE, ID_CLOSE] {
                     let button = GetDlgItem(hwnd, id);
                     let mut rect = RECT::default();
                     if !button.is_null()
@@ -412,11 +414,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                             return 1;
                         }
                     }
-                    WM_MEASUREITEM => {
-                        if state.measure_item(lp as *mut MEASUREITEMSTRUCT) {
-                            return 1;
-                        }
-                    }
                     WM_NEXTDLGCTL => {
                         if lp != 0 {
                             let target = wp as HWND;
@@ -459,7 +456,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     WM_MOUSEWHEEL => {
                         let delta = ((wp >> 16) as i16) as i32;
                         state.scroll =
-                            (state.scroll - delta / 120 * 72).clamp(0, state.scroll_limit());
+                            (state.scroll - delta * 72 / 120).clamp(0, state.scroll_limit());
                         state.layout();
                         return 0;
                     }
@@ -528,9 +525,26 @@ impl State {
 
     fn tab_order(&self) -> Vec<i32> {
         match self.tab {
-            0 => vec![100, 101, 111, 3, 114, 112, 113, 116],
-            1 => vec![100, 101, 211, 213, 214, 215, 216],
-            _ => vec![100, 101],
+            0 => vec![
+                ID_GENERAL_TAB,
+                ID_GAMEPAD_TAB,
+                ID_CLIENTS,
+                ID_REFRESH,
+                ID_TOGGLE_ALLOWED,
+                ID_MOVE_UP,
+                ID_MOVE_DOWN,
+                ID_REFRESH_MODE,
+            ],
+            1 => vec![
+                ID_GENERAL_TAB,
+                ID_GAMEPAD_TAB,
+                ID_CONTROLLER,
+                ID_BINDINGS,
+                ID_ASSIGN,
+                ID_UNASSIGN,
+                ID_CANCEL_CAPTURE,
+            ],
+            _ => vec![ID_GENERAL_TAB, ID_GAMEPAD_TAB],
         }
     }
 
@@ -566,11 +580,7 @@ impl State {
         if control.tab != self.tab {
             return;
         }
-        let visible_height = if control.rect[3] > 200 && [116, 211].contains(&id) {
-            theme::FIELD_HEIGHT
-        } else {
-            control.rect[3]
-        };
+        let visible_height = control_visible_height(id, control.rect[3]);
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.hwnd, &mut client);
@@ -636,14 +646,18 @@ impl State {
         self.control(id, tab, "STATIC", text, 0, [x, y, width, 18], width >= 200);
     }
     fn button(&mut self, id: i32, tab: i32, text: &str, x: i32, y: i32, width: i32) {
-        let height = if id == 5 || id == 6 {
+        let height = if id == ID_MINIMIZE || id == ID_CLOSE {
             theme::TITLE_BUTTON_SIZE
-        } else if (100..=101).contains(&id) {
+        } else if (ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id) {
             theme::TAB_BUTTON_HEIGHT
         } else {
             theme::BUTTON_HEIGHT
         };
-        let tab_stop = if id == 5 || id == 6 { 0 } else { WS_TABSTOP };
+        let tab_stop = if id == ID_MINIMIZE || id == ID_CLOSE {
+            0
+        } else {
+            WS_TABSTOP
+        };
         self.control(
             id,
             tab,
@@ -651,7 +665,7 @@ impl State {
             text,
             tab_stop | BS_OWNERDRAW as u32,
             [x, y, width, height],
-            id == 113 || id == 114,
+            id == ID_MOVE_DOWN || id == ID_TOGGLE_ALLOWED,
         );
     }
     fn combo(&mut self, id: i32, tab: i32, x: i32, y: i32, width: i32) {
@@ -732,7 +746,7 @@ impl State {
     }
     fn update_list_heights(&self) {
         unsafe {
-            for id in [111, 213] {
+            for id in [ID_CLIENTS, ID_BINDINGS] {
                 let hwnd = self.hwnd(id);
                 if !hwnd.is_null() {
                     SendMessageW(hwnd, LB_SETITEMHEIGHT, 0, theme::px(22, self.dpi) as LPARAM);
@@ -771,22 +785,7 @@ impl State {
     }
     fn font_update(&mut self) {
         unsafe {
-            let font = CreateFontW(
-                -(12 * self.dpi as i32 / 96),
-                0,
-                0,
-                0,
-                FW_NORMAL as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY as u32,
-                0,
-                w!("Segoe UI"),
-            );
+            let font = create_font(12, FW_NORMAL as i32, self.dpi);
             if !font.is_null() {
                 for c in self.controls.values() {
                     SendMessageW(c.hwnd, WM_SETFONT, font as usize, 1);
@@ -796,83 +795,42 @@ impl State {
                 }
                 self.font = font;
             }
-            let section_font = CreateFontW(
-                -(12 * self.dpi as i32 / 96),
-                0,
-                0,
-                0,
-                FW_BOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY as u32,
-                0,
-                w!("Segoe UI"),
-            );
+            let section_font = create_font(12, FW_BOLD as i32, self.dpi);
             if !section_font.is_null() {
                 if !self.section_font.is_null() {
                     DeleteObject(self.section_font);
                 }
                 self.section_font = section_font;
             }
-            let title_font = CreateFontW(
-                -(12 * self.dpi as i32 / 96),
-                0,
-                0,
-                0,
-                FW_BOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                CLEARTYPE_QUALITY as u32,
-                0,
-                w!("Segoe UI"),
-            );
-            if !title_font.is_null() {
-                if !self.title_font.is_null() {
-                    DeleteObject(self.title_font);
-                }
-                self.title_font = title_font;
-            }
         }
     }
     fn create_controls(&mut self) {
         self.font_update();
-        self.button(5, -1, "Minimize", 0, 3, 24);
-        self.button(6, -1, "Close", 0, 3, 24);
-        self.button(100, -1, "&General", 13, 42, 132);
-        self.button(101, -1, "Game&pad", 145, 42, 132);
-        self.list(111, 0, 16, 108, 258, 88);
-        self.button(3, 0, "&Refresh", 16, 205, 125);
-        self.button(114, 0, "Allow / Deny", 149, 205, 125);
-        self.button(112, 0, "Move &Up", 16, 239, 125);
-        self.button(113, 0, "Move &Down", 149, 239, 125);
+        self.button(ID_MINIMIZE, -1, "Minimize", 0, 3, 24);
+        self.button(ID_CLOSE, -1, "Close", 0, 3, 24);
+        self.button(ID_GENERAL_TAB, -1, "&General", 13, 42, 132);
+        self.button(ID_GAMEPAD_TAB, -1, "Game&pad", 145, 42, 132);
+        self.list(ID_CLIENTS, 0, 16, 108, 258, 88);
+        self.button(ID_REFRESH, 0, "&Refresh", 16, 205, 125);
+        self.button(ID_TOGGLE_ALLOWED, 0, "Allow / Deny", 149, 205, 125);
+        self.button(ID_MOVE_UP, 0, "Move &Up", 16, 239, 125);
+        self.button(ID_MOVE_DOWN, 0, "Move &Down", 149, 239, 125);
         self.label(115, 0, "Refresh mode", 16, 316, 258);
-        self.combo(116, 0, 16, 340, 258);
+        self.combo(ID_REFRESH_MODE, 0, 16, 340, 258);
         for t in ["Manual", "Periodic", "On switch"] {
-            self.add(116, t, true);
+            self.add(ID_REFRESH_MODE, t, true);
         }
 
         self.label(210, 1, "Active controller", 16, 108, 258);
-        self.combo(211, 1, 16, 132, 258);
-        self.list(213, 1, 16, 204, 258, 90);
-        self.button(214, 1, "&Assign", 16, 302, 81);
-        self.button(215, 1, "&Unassign", 105, 302, 81);
-        self.button(216, 1, "&Cancel", 194, 302, 80);
+        self.combo(ID_CONTROLLER, 1, 16, 132, 258);
+        self.list(ID_BINDINGS, 1, 16, 204, 258, 90);
+        self.button(ID_ASSIGN, 1, "&Assign", 16, 302, 81);
+        self.button(ID_UNASSIGN, 1, "&Unassign", 105, 302, 81);
+        self.button(ID_CANCEL_CAPTURE, 1, "&Cancel", 194, 302, 80);
         self.label(90, 1, "", 16, 338, 258);
     }
     fn scroll_limit(&self) -> i32 {
-        let content_end = match self.tab {
-            0 => theme::CONTENT_BOTTOM,
-            1 => theme::CONTENT_BOTTOM,
-            _ => 0,
-        };
+        let content_end = theme::CONTENT_BOTTOM;
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.hwnd, &mut client);
@@ -908,31 +866,38 @@ impl State {
                 if c.stretch {
                     width = (width + width_delta).max(1);
                 }
-                if (100..=101).contains(&id) {
+                if (ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id) {
                     let inset =
                         theme::CONTENT_MARGIN + theme::TABBAR_BORDER + theme::TABBAR_PADDING;
                     let slot = (logical_width - 2 * inset).max(2) / 2;
-                    x = inset + (id - 100) * slot;
+                    x = inset + (id - ID_GENERAL_TAB) * slot;
                     y = theme::TABBAR_TOP + theme::TABBAR_BORDER + theme::TABBAR_PADDING;
                     width = slot;
-                } else if id == 5 {
+                } else if id == ID_MINIMIZE {
                     x = logical_width - 57;
                     y = 3;
                     width = theme::TITLE_BUTTON_SIZE;
-                } else if id == 6 {
+                } else if id == ID_CLOSE {
                     x = logical_width - 29;
                     y = 3;
                     width = theme::TITLE_BUTTON_SIZE;
-                } else if matches!(id, 3 | 112 | 114 | 113) {
+                } else if matches!(
+                    id,
+                    ID_REFRESH | ID_MOVE_UP | ID_TOGGLE_ALLOWED | ID_MOVE_DOWN
+                ) {
                     let inset = theme::CONTENT_MARGIN + theme::SECTION_PADDING;
                     let slot = (logical_width - 2 * inset - 8).max(2) / 2;
-                    let order = if matches!(id, 3 | 112) { 0 } else { 1 };
+                    let order = if matches!(id, ID_REFRESH | ID_MOVE_UP) {
+                        0
+                    } else {
+                        1
+                    };
                     x = inset + order * (slot + 8);
                     width = slot;
-                } else if (214..=216).contains(&id) {
+                } else if (ID_ASSIGN..=ID_CANCEL_CAPTURE).contains(&id) {
                     let inset = theme::CONTENT_MARGIN + theme::SECTION_PADDING;
                     let slot = (logical_width - 2 * inset - 16).max(3) / 3;
-                    x = inset + (id - 214) * (slot + 8);
+                    x = inset + (id - ID_ASSIGN) * (slot + 8);
                     width = slot;
                 }
                 if c.tab >= 0 {
@@ -946,11 +911,7 @@ impl State {
                     theme::px(h, self.dpi),
                     1,
                 );
-                let visible_height = if h > 200 && [116, 211].contains(&id) {
-                    theme::FIELD_HEIGHT
-                } else {
-                    h
-                };
+                let visible_height = control_visible_height(id, h);
                 ShowWindow(
                     c.hwnd,
                     if id == 90 && self.gamepad_status.is_empty() {
@@ -1041,11 +1002,7 @@ impl State {
         }
     }
     fn scroll_content_height(&self) -> i32 {
-        let content_end = match self.tab {
-            0 => theme::CONTENT_BOTTOM,
-            1 => theme::CONTENT_BOTTOM,
-            _ => 0,
-        };
+        let content_end = theme::CONTENT_BOTTOM;
         (content_end - theme::CONTENT_TOP).max(1)
     }
     fn paint(&self, hwnd: HWND) {
@@ -1089,7 +1046,7 @@ impl State {
             }
             SetBkMode(dc, TRANSPARENT as i32);
             SetTextColor(dc, theme::TEXT);
-            let old_title = SelectObject(dc, self.title_font);
+            let old_title = SelectObject(dc, self.section_font);
             let title = wide("Switchmut");
             let mut title_rect = RECT {
                 left: px(49),
@@ -1211,24 +1168,22 @@ impl State {
             let selected = item.itemState & ODS_SELECTED != 0;
             let disabled = item.itemState & ODS_DISABLED != 0;
             let focused = item.itemState & ODS_FOCUS != 0;
-            if id == 5 || id == 6 {
+            if id == ID_MINIMIZE || id == ID_CLOSE {
                 let dc = item.hDC;
                 let px = |value| theme::px(value, self.dpi);
                 FillRect(dc, &item.rcItem, self.theme.topbar);
                 let old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
                 let old_pen = SelectObject(dc, GetStockObject(DC_PEN));
-                let old_brush_color = SetDCBrushColor(dc, theme::COMPACT);
-                let old_pen_color = SetDCPenColor(dc, theme::BORDER);
-                let close_hover = id == 6 && selected;
-                SetDCBrushColor(
+                let close_pressed = id == ID_CLOSE && selected;
+                let old_brush_color = SetDCBrushColor(
                     dc,
-                    if close_hover {
+                    if close_pressed {
                         theme::DANGER
                     } else {
                         theme::COMPACT
                     },
                 );
-                SetDCPenColor(dc, theme::BORDER);
+                let old_pen_color = SetDCPenColor(dc, theme::BORDER);
                 Ellipse(
                     dc,
                     item.rcItem.left + px(1),
@@ -1239,7 +1194,7 @@ impl State {
                 SetDCPenColor(dc, theme::TEXT);
                 let cx = (item.rcItem.left + item.rcItem.right) / 2;
                 let cy = (item.rcItem.top + item.rcItem.bottom) / 2;
-                if id == 5 {
+                if id == ID_MINIMIZE {
                     MoveToEx(dc, cx - px(4), cy, null_mut());
                     LineTo(dc, cx + px(4), cy);
                 } else {
@@ -1255,8 +1210,8 @@ impl State {
                 return;
             }
 
-            let brush = if (100..=101).contains(&id) {
-                if id - 100 == self.tab {
+            let brush = if (ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id) {
+                if id - ID_GENERAL_TAB == self.tab {
                     self.theme.compact
                 } else {
                     self.theme.sunk
@@ -1267,7 +1222,7 @@ impl State {
                 self.theme.compact
             };
             FillRect(item.hDC, &item.rcItem, brush);
-            if !(100..=101).contains(&id) {
+            if !(ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id) {
                 FrameRect(item.hDC, &item.rcItem, self.theme.border);
             }
             if focused {
@@ -1278,13 +1233,15 @@ impl State {
                 item.hDC,
                 if disabled {
                     theme::SECONDARY
-                } else if (100..=101).contains(&id) && id - 100 == self.tab {
+                } else if (ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id)
+                    && id - ID_GENERAL_TAB == self.tab
+                {
                     theme::ACCENT_TEXT
                 } else {
                     theme::TEXT
                 },
             );
-            let button_font = if (100..=101).contains(&id) {
+            let button_font = if (ID_GENERAL_TAB..=ID_GAMEPAD_TAB).contains(&id) {
                 self.section_font
             } else {
                 self.font
@@ -1328,7 +1285,7 @@ impl State {
                 item.hDC,
                 &item.rcItem,
                 if selected {
-                    self.theme.selected
+                    self.theme.accent_strong
                 } else {
                     self.theme.input
                 },
@@ -1363,22 +1320,9 @@ impl State {
             }
         }
     }
-    fn measure_item(&self, item: *mut MEASUREITEMSTRUCT) -> bool {
-        if item.is_null() {
-            return false;
-        }
-        unsafe {
-            let item = &mut *item;
-            if item.CtlType == ODT_LISTBOX && [111, 213].contains(&(item.CtlID as i32)) {
-                item.itemHeight = (22 * self.dpi / 96).max(18);
-                return true;
-            }
-        }
-        false
-    }
     fn refresh_all(&mut self) {
         self.select(
-            116,
+            ID_REFRESH_MODE,
             match self.draft.refresh_mode {
                 RefreshMode::Manual => 0,
                 RefreshMode::Periodic => 1,
@@ -1394,7 +1338,7 @@ impl State {
         self.refresh_clients_with_key(self.selected_client_key());
     }
     fn selected_client_key(&self) -> Option<ClientKey> {
-        self.selection(111, false)
+        self.selection(ID_CLIENTS, false)
             .and_then(|index| self.clients.get(index).map(|client| client.key))
     }
     fn refresh_clients_with_key(&self, selected_key: Option<ClientKey>) {
@@ -1406,10 +1350,10 @@ impl State {
                 })
             })
             .unwrap_or(0);
-        self.clear(111, false);
+        self.clear(ID_CLIENTS, false);
         for c in &self.clients {
             self.add(
-                111,
+                ID_CLIENTS,
                 &format!(
                     "{} {} | PID {} | {}",
                     if Some(c.key) == self.current {
@@ -1425,14 +1369,14 @@ impl State {
             );
         }
         if !self.clients.is_empty() {
-            self.select(111, selected.min(self.clients.len() - 1), false);
+            self.select(ID_CLIENTS, selected.min(self.clients.len() - 1), false);
         }
     }
     fn refresh_devices(&self) {
-        self.clear(211, true);
-        self.add(211, "Automatic", true);
+        self.clear(ID_CONTROLLER, true);
+        self.add(ID_CONTROLLER, "Automatic", true);
         for d in &self.devices {
-            self.add(211, &d.name, true);
+            self.add(ID_CONTROLLER, &d.name, true);
         }
         let selection = self
             .draft
@@ -1441,82 +1385,76 @@ impl State {
             .and_then(|id| self.devices.iter().position(|d| &d.id == id))
             .map(|i| i + 1);
         if self.draft.controller.is_some() && selection.is_none() {
-            self.add(211, "Selected controller (disconnected)", true);
-            self.select(211, self.devices.len() + 1, true);
+            self.add(ID_CONTROLLER, "Selected controller (disconnected)", true);
+            self.select(ID_CONTROLLER, self.devices.len() + 1, true);
         } else {
-            self.select(211, selection.unwrap_or(0), true);
+            self.select(ID_CONTROLLER, selection.unwrap_or(0), true);
         }
     }
     fn refresh_bindings(&self, index: usize) {
-        self.clear(213, false);
+        self.clear(ID_BINDINGS, false);
         for action in Action::ALL {
             let binding = self
                 .draft
                 .bindings
                 .get(action)
-                .map_or_else(|| "Unassigned".into(), |b| button_name(b, false));
-            self.add(213, &format!("{}: {binding}", action.label()), false);
+                .map_or_else(|| "Unassigned".into(), button_name);
+            self.add(
+                ID_BINDINGS,
+                &format!("{}: {binding}", action.label()),
+                false,
+            );
         }
-        self.select(213, index, false);
+        self.select(ID_BINDINGS, index, false);
     }
-    fn read_fields(&mut self) -> Result<(), String> {
-        self.draft.refresh_mode = match self.selection(116, true) {
+    fn read_fields(&mut self) {
+        self.draft.refresh_mode = match self.selection(ID_REFRESH_MODE, true) {
             Some(0) => RefreshMode::Manual,
             Some(1) => RefreshMode::Periodic,
             _ => RefreshMode::OnSwitch,
         };
-        self.draft.validate()
     }
-    fn emit_save(&mut self) -> Result<(), String> {
-        self.read_fields()?;
+    fn emit_save(&mut self) {
+        self.read_fields();
         self.next_save_request = self.next_save_request.wrapping_add(1);
-        if self.next_save_request == 0 {
-            self.next_save_request = 1;
-        }
         let request_id = self.next_save_request;
         self.pending_save = Some(request_id);
         self.show_save_feedback = self.tab == 1;
         self.status("Saving changes...");
-        if let Err(error) = self.sender.send(SettingsEvent::Save {
+        let _ = self.sender.send(SettingsEvent::Save {
             request_id,
             config: Box::new(self.draft.clone()),
-            clients: self.clients.clone(),
-        }) {
-            self.pending_save = None;
-            self.show_save_feedback = false;
-            return Err(format!("could not deliver save request: {error}"));
-        }
-        Ok(())
+        });
     }
-    fn emit_client_edits(&mut self) -> Result<(), String> {
-        self.sender
-            .send(SettingsEvent::ClientEdits(self.clients.clone()))
-            .map_err(|error| format!("could not deliver client changes: {error}"))
+    fn emit_client_edits(&mut self) {
+        let _ = self
+            .sender
+            .send(SettingsEvent::ClientEdits(self.clients.clone()));
     }
     fn command(&mut self, id: i32, notification: u32) {
         match id {
-            5 => unsafe {
+            ID_MINIMIZE => unsafe {
                 PostMessageW(self.hwnd, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
             },
-            6 => unsafe {
+            ID_CLOSE => unsafe {
                 PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
             },
-            2 => self.cancel(),
-            3 => {
+            IDCANCEL => self.cancel(),
+            ID_REFRESH => {
                 let _ = self.sender.send(SettingsEvent::Refresh);
             }
-            100..=101 => {
+            ID_GENERAL_TAB..=ID_GAMEPAD_TAB => {
                 if self.capturing.take().is_some() {
                     let _ = self.sender.send(SettingsEvent::EndCapture);
                 }
                 self.clear_status();
-                self.tab = id - 100;
+                self.tab = id - ID_GENERAL_TAB;
                 self.scroll = 0;
                 self.layout();
             }
-            112 | 113 => {
-                if let Some(i) = self.selection(111, false) {
-                    let j = if id == 112 {
+            ID_MOVE_UP | ID_MOVE_DOWN => {
+                if let Some(i) = self.selection(ID_CLIENTS, false) {
+                    let j = if id == ID_MOVE_UP {
                         i.saturating_sub(1)
                     } else {
                         (i + 1).min(self.clients.len().saturating_sub(1))
@@ -1524,32 +1462,26 @@ impl State {
                     if i < self.clients.len() && i != j {
                         self.clients.swap(i, j);
                         self.refresh_clients();
-                        self.select(111, j, false);
-                        if let Err(error) = self.emit_client_edits() {
-                            self.notice(&error);
-                        }
+                        self.select(ID_CLIENTS, j, false);
+                        self.emit_client_edits();
                     }
                 }
             }
-            114 => {
-                if let Some(i) = self.selection(111, false)
+            ID_TOGGLE_ALLOWED => {
+                if let Some(i) = self.selection(ID_CLIENTS, false)
                     && let Some(c) = self.clients.get_mut(i)
                 {
                     c.allowed = !c.allowed;
                     self.refresh_clients();
-                    if let Err(error) = self.emit_client_edits() {
-                        self.notice(&error);
-                    }
+                    self.emit_client_edits();
                 }
             }
-            116 if notification == CBN_SELCHANGE => {
-                if let Err(error) = self.emit_save() {
-                    self.notice(&error);
-                }
+            ID_REFRESH_MODE if notification == CBN_SELCHANGE => {
+                self.emit_save();
             }
-            211 if notification == CBN_SELCHANGE => {
+            ID_CONTROLLER if notification == CBN_SELCHANGE => {
                 let previous = self.draft.controller.clone();
-                if let Some(i) = self.selection(211, true) {
+                if let Some(i) = self.selection(ID_CONTROLLER, true) {
                     if i == 0 {
                         self.draft.controller = None;
                     } else if let Some(d) = self.devices.get(i - 1) {
@@ -1562,14 +1494,11 @@ impl State {
                             self.draft.controller.clone(),
                         ));
                     }
-                    if let Err(error) = self.emit_save() {
-                        self.notice(&error);
-                    }
+                    self.emit_save();
                 }
-                self.refresh_bindings(self.selection(213, false).unwrap_or(0));
             }
-            214 => {
-                if let Some(i) = self.selection(213, false) {
+            ID_ASSIGN => {
+                if let Some(i) = self.selection(ID_BINDINGS, false) {
                     self.capturing = Some(i);
                     let _ = self.sender.send(SettingsEvent::CaptureController(
                         self.draft.controller.clone(),
@@ -1577,9 +1506,9 @@ impl State {
                     self.status("Press a button to assign it.");
                 }
             }
-            215 => {
+            ID_UNASSIGN => {
                 let mut changed = false;
-                if let Some(i) = self.selection(213, false) {
+                if let Some(i) = self.selection(ID_BINDINGS, false) {
                     if let Some(action) = Action::ALL.get(i) {
                         changed = self.draft.bindings.get(*action).is_some();
                         self.draft.bindings.set(*action, None);
@@ -1590,14 +1519,12 @@ impl State {
                     let _ = self.sender.send(SettingsEvent::EndCapture);
                 }
                 if changed {
-                    if let Err(error) = self.emit_save() {
-                        self.notice(&error);
-                    }
+                    self.emit_save();
                 } else {
                     self.clear_status();
                 }
             }
-            216 => {
+            ID_CANCEL_CAPTURE => {
                 if self.capturing.take().is_some() {
                     let _ = self.sender.send(SettingsEvent::EndCapture);
                 }
@@ -1605,6 +1532,35 @@ impl State {
             }
             _ => {}
         }
+    }
+}
+
+fn control_visible_height(id: i32, height: i32) -> i32 {
+    if height > 200 && [ID_REFRESH_MODE, ID_CONTROLLER].contains(&id) {
+        theme::FIELD_HEIGHT
+    } else {
+        height
+    }
+}
+
+fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
+    unsafe {
+        CreateFontW(
+            -(size * dpi as i32 / 96),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            0,
+            0,
+            CLEARTYPE_QUALITY as u32,
+            0,
+            w!("Segoe UI"),
+        )
     }
 }
 
@@ -1629,7 +1585,7 @@ fn control_color(message: u32, dc: HDC) -> HBRUSH {
     }
 }
 
-pub fn button_name(button: u8, _xinput: bool) -> String {
+pub fn button_name(button: u8) -> String {
     format!("Button {button}")
 }
 
@@ -1639,7 +1595,7 @@ mod tests {
 
     #[test]
     fn binding_labels_use_numeric_button_names() {
-        assert_eq!(button_name(9, true), "Button 9");
-        assert_eq!(button_name(27, false), "Button 27");
+        assert_eq!(button_name(9), "Button 9");
+        assert_eq!(button_name(27), "Button 27");
     }
 }

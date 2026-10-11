@@ -27,7 +27,6 @@ use windows_sys::{
         System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::{
             Controls::{ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx},
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
             WindowsAndMessaging::*,
         },
     },
@@ -35,7 +34,6 @@ use windows_sys::{
 };
 
 const SHOW_SETTINGS: u32 = WM_APP + 2;
-const OWNER_DISPATCH: u32 = WM_APP + 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OwnerEvent {
@@ -46,14 +44,13 @@ enum OwnerEvent {
     Tray(TrayCallback),
 }
 
-fn should_end_popup(popup_active: bool, popup_ending: bool, message: u32) -> bool {
-    popup_active && !popup_ending && matches!(message, WM_CLOSE | WM_CANCELMODE)
+fn should_end_popup(popup_active: bool, popup_ending: bool) -> bool {
+    popup_active && !popup_ending
 }
 
 struct OwnerState {
     restart_message: u32,
     events: VecDeque<OwnerEvent>,
-    wake_pending: bool,
     popup_active: bool,
     // EndMenu may re-enter the owner procedure with WM_CANCELMODE.
     popup_ending: bool,
@@ -64,35 +61,27 @@ impl OwnerState {
         Self {
             restart_message,
             events: VecDeque::new(),
-            wake_pending: false,
             popup_active: false,
             popup_ending: false,
             closing: false,
         }
     }
 
-    fn enqueue(&mut self, event: OwnerEvent) -> bool {
+    fn enqueue(&mut self, event: OwnerEvent) {
         if self.closing && event != OwnerEvent::Close {
-            return false;
+            return;
         }
         if event == OwnerEvent::Close {
             self.closing = true;
             self.events.clear();
         }
-        if self.events.contains(&event) {
-            return false;
-        }
-        self.events.push_back(event);
-        if self.wake_pending {
-            false
-        } else {
-            self.wake_pending = true;
-            true
+        if !self.events.contains(&event) {
+            self.events.push_back(event);
         }
     }
 
-    fn request_popup_end(&mut self, message: u32) -> bool {
-        let end = should_end_popup(self.popup_active, self.popup_ending, message);
+    fn request_popup_end(&mut self) -> bool {
+        let end = should_end_popup(self.popup_active, self.popup_ending);
         self.popup_ending |= end;
         end
     }
@@ -148,11 +137,7 @@ impl Owner {
     }
 
     fn next_event(&mut self) -> Option<OwnerEvent> {
-        let event = self.state.events.pop_front();
-        if self.state.events.is_empty() {
-            self.state.wake_pending = false;
-        }
-        event
+        self.state.events.pop_front()
     }
 
     fn set_popup_active(&mut self, active: bool) {
@@ -163,7 +148,6 @@ impl Owner {
     fn begin_shutdown(&mut self) {
         self.state.closing = true;
         self.state.events.clear();
-        self.state.wake_pending = false;
     }
 }
 impl Drop for Owner {
@@ -172,6 +156,54 @@ impl Drop for Owner {
             KillTimer(self.hwnd, 1);
             DestroyWindow(self.hwnd);
         }
+    }
+}
+
+fn should_refresh_for_switch(refresh_mode: RefreshMode, rotation_empty: bool) -> bool {
+    refresh_mode == RefreshMode::OnSwitch || rotation_empty
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationDecision {
+    Ignore,
+    Complete,
+    Retry { previous: bool },
+}
+
+#[derive(Default)]
+struct ActivationState {
+    pending: Option<(ClientKey, Option<bool>, Instant)>,
+}
+
+impl ActivationState {
+    fn request(&mut self, key: ClientKey, retry_direction: Option<bool>, now: Instant) {
+        self.pending = Some((key, retry_direction, now));
+    }
+
+    fn result(&mut self, key: ClientKey, result: platform::ActivationResult) -> ActivationDecision {
+        let Some((pending_key, retry_direction, _)) = self.pending else {
+            return ActivationDecision::Ignore;
+        };
+        if pending_key != key {
+            return ActivationDecision::Ignore;
+        }
+        self.pending = None;
+        if result == platform::ActivationResult::Stale
+            && let Some(previous) = retry_direction
+        {
+            ActivationDecision::Retry { previous }
+        } else {
+            ActivationDecision::Complete
+        }
+    }
+
+    fn expire(&mut self, now: Instant) -> Option<ClientKey> {
+        let (key, _, started) = self.pending?;
+        if now.duration_since(started) < Duration::from_millis(500) {
+            return None;
+        }
+        self.pending = None;
+        Some(key)
     }
 }
 
@@ -194,12 +226,11 @@ struct App {
     exit: bool,
     suppress_until_release: u32,
     awaiting_selection: Option<u64>,
-    pending_activation: Option<(ClientKey, Option<bool>, Instant)>,
+    activation_state: ActivationState,
 }
 
 pub fn run() -> Result<(), String> {
     unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_STANDARD_CLASSES,
@@ -221,26 +252,6 @@ pub fn run() -> Result<(), String> {
             }
         }
         return Ok(());
-    }
-    let previous_mutex = unsafe { CreateMutexW(null(), 0, w!("Local\\Switchmut.Rust.3")) };
-    if previous_mutex.is_null() {
-        return Err(format!(
-            "Could not inspect the previous Switchmut instance: {}",
-            unsafe { GetLastError() }
-        ));
-    }
-    let previous_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    let _previous_mutex = Mutex(previous_mutex);
-    if previous_exists {
-        unsafe {
-            let window = FindWindowW(w!("Switchmut.Owner"), null());
-            if !window.is_null() {
-                PostMessageW(window, WM_CLOSE, 0, 0);
-            }
-        }
-        return Err(
-            "A previous Switchmut instance is still running; its normal shutdown was requested. Retry after it exits.".into(),
-        );
     }
     let path = config::config_path()?;
     let directory = path.parent().ok_or("Configuration directory is missing")?;
@@ -289,7 +300,7 @@ pub fn run() -> Result<(), String> {
         exit: false,
         suppress_until_release: 0,
         awaiting_selection: Some(initial_selection),
-        pending_activation: None,
+        activation_state: ActivationState::default(),
     };
     app.refresh();
     app.open_settings();
@@ -331,12 +342,14 @@ pub fn run() -> Result<(), String> {
                     OwnerEvent::Tick => app.tick(),
                     OwnerEvent::Close => app.exit = true,
                     OwnerEvent::ShowSettings => app.open_settings(),
-                    OwnerEvent::RestoreTray => match tray.restore() {
-                        Ok(()) => app.log.write("TaskbarCreated received; tray icon restored"),
-                        Err(error) => app.log.write(format!(
-                            "TaskbarCreated received; tray icon restore failed (Win32 {error})"
-                        )),
-                    },
+                    OwnerEvent::RestoreTray => {
+                        if tray.restore() {
+                            app.log.write("TaskbarCreated received; tray icon restored")
+                        } else {
+                            app.log
+                                .write("TaskbarCreated received; tray icon restore failed")
+                        }
+                    }
                     OwnerEvent::Tray(TrayCallback::OpenSettings) => app.open_settings(),
                     OwnerEvent::Tray(TrayCallback::OpenContextMenu) => {
                         owner.set_popup_active(true);
@@ -388,19 +401,10 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: L
     if state.is_null() {
         return unsafe { DefWindowProcW(hwnd, message, wp, lp) };
     }
-    if message == OWNER_DISPATCH {
-        unsafe {
-            (*state).wake_pending = false;
-        }
-        return 0;
-    }
     if message == WM_CANCELMODE {
         let (popup_active, end_popup) = {
             let owner_state = unsafe { &mut *state };
-            (
-                owner_state.popup_active,
-                owner_state.request_popup_end(message),
-            )
+            (owner_state.popup_active, owner_state.request_popup_end())
         };
         if popup_active {
             if end_popup {
@@ -423,11 +427,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: L
         let callback = decode_callback(lp);
         if let Some(TrayCallback::OpenContextMenu) = callback {
             let owner_state = unsafe { &mut *state };
-            if owner_state.popup_active
-                || owner_state
-                    .events
-                    .contains(&OwnerEvent::Tray(TrayCallback::OpenContextMenu))
-            {
+            if owner_state.popup_active {
                 return 0;
             }
         }
@@ -436,20 +436,13 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: L
         None
     };
     if let Some(event) = event {
-        // Only this UI-thread procedure mutates routing state. The wake message
-        // lets the outer loop drain it without borrowing App inside nested menus.
-        let (wake, end_popup) = {
+        // Queue events so nested menus never borrow App. The outer loop drains them after
+        // each posted message, so events from sent messages wait for the next 10 ms tick.
+        let end_popup = {
             let owner_state = unsafe { &mut *state };
-            (
-                owner_state.enqueue(event),
-                event == OwnerEvent::Close && owner_state.request_popup_end(message),
-            )
+            owner_state.enqueue(event);
+            event == OwnerEvent::Close && owner_state.request_popup_end()
         };
-        if wake {
-            unsafe {
-                PostMessageW(hwnd, OWNER_DISPATCH, 0, 0);
-            }
-        }
         if end_popup {
             unsafe {
                 EndMenu();
@@ -568,41 +561,36 @@ impl App {
                 }
             }
             InputEvent::Button(edge) => {
-                if edge.button >= 32 || self.awaiting_selection.is_some() {
-                    return;
-                }
-                let mask = 1u32 << edge.button;
-                if !edge.pressed {
-                    self.suppress_until_release &= !mask;
-                }
-                if edge.pressed && self.settings.as_ref().is_some_and(|s| s.capturing()) {
-                    self.cancel_menu();
-                    if let Some(s) = &self.settings {
-                        s.capture_button(edge.button);
-                    }
-                    self.awaiting_selection =
-                        Some(self.input.select(self.config.controller.clone()));
-                    self.suppress_until_release |= mask;
-                    self.log.write(format!(
-                        "assignment captured button={}; normal command suppressed",
-                        edge.button
-                    ));
-                    return;
-                }
-                if self.settings.as_ref().is_some_and(|s| s.capturing())
-                    || (self.suppress_until_release & mask) != 0
-                {
-                    return;
-                }
-                match crate::actions::route_button(
+                let (routing, suppression) = crate::actions::route_button_edge(
                     &self.config.bindings,
                     edge.button,
                     edge.pressed,
-                    false,
-                ) {
-                    crate::actions::Routing::MenuRelease => self.release_menu(),
-                    crate::actions::Routing::Command(action) => self.execute(action),
-                    _ => {}
+                    self.settings.as_ref().is_some_and(|s| s.capturing()),
+                    self.awaiting_selection.is_some(),
+                    self.suppress_until_release,
+                );
+                match routing {
+                    crate::actions::Routing::Capture(button) => {
+                        self.cancel_menu();
+                        if let Some(s) = &self.settings {
+                            s.capture_button(button);
+                        }
+                        self.awaiting_selection =
+                            Some(self.input.select(self.config.controller.clone()));
+                        self.suppress_until_release = suppression;
+                        self.log.write(format!(
+                            "assignment captured button={}; normal command suppressed",
+                            button
+                        ));
+                    }
+                    routing => {
+                        self.suppress_until_release = suppression;
+                        match routing {
+                            crate::actions::Routing::MenuRelease => self.release_menu(),
+                            crate::actions::Routing::Command(action) => self.execute(action),
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -611,9 +599,10 @@ impl App {
         self.log.write(format!("command {}", action.label()));
         match action {
             Action::Next | Action::Previous => {
-                if self.config.refresh_mode == RefreshMode::OnSwitch
-                    || self.rotation.clients().is_empty()
-                {
+                if should_refresh_for_switch(
+                    self.config.refresh_mode,
+                    self.rotation.clients().is_empty(),
+                ) {
                     self.refresh_clients(true);
                 }
                 if let Some(key) = self.rotation.next(action == Action::Previous) {
@@ -630,39 +619,28 @@ impl App {
         }
     }
     fn request_activation(&mut self, key: ClientKey, retry_direction: Option<bool>) {
-        if self.activation.request(key) {
-            self.pending_activation = Some((key, retry_direction, Instant::now()));
-        } else {
-            self.log
-                .write(format!("activation target={key:?} was already pending"));
-        }
+        self.activation.request(key);
+        self.activation_state
+            .request(key, retry_direction, Instant::now());
     }
     fn drain_activation(&mut self) {
         while let Some((key, result)) = self.activation.try_result() {
-            let Some((pending_key, retry_direction, _started)) = self.pending_activation else {
-                continue;
-            };
-            if pending_key != key {
+            let decision = self.activation_state.result(key, result);
+            if decision == ActivationDecision::Ignore {
                 continue;
             }
-            self.pending_activation = None;
             self.log.write(format!(
                 "activation target={key:?} result={result:?} observed_foreground={:?}",
                 unsafe { GetForegroundWindow() }
             ));
-            if result == platform::ActivationResult::Stale
-                && let Some(previous) = retry_direction
-            {
+            if let ActivationDecision::Retry { previous } = decision {
                 self.refresh_clients(true);
                 if let Some(retry) = self.rotation.next(previous) {
                     self.request_activation(retry, None);
                 }
             }
         }
-        if let Some((key, _, started)) = self.pending_activation
-            && started.elapsed() >= Duration::from_millis(500)
-        {
-            self.pending_activation = None;
+        if let Some(key) = self.activation_state.expire(Instant::now()) {
             self.log.write(format!(
                 "activation target={key:?} timed out waiting for worker"
             ));
@@ -673,7 +651,7 @@ impl App {
             return;
         }
         self.menu_origin = self.rotation.current();
-        let mut menu = Radial::new(self.config.menu.clone(), self.menu_origin);
+        let mut menu = Radial::new(self.menu_origin);
         if !menu.open() {
             self.log.write("native radial menu creation failed");
         }
@@ -732,9 +710,7 @@ impl App {
                     self.log.write("session client edits applied");
                 }
                 SettingsEvent::Save {
-                    request_id,
-                    config,
-                    clients: _,
+                    request_id, config, ..
                 } => {
                     let controller_changed = self.config.controller != config.controller;
                     let bindings_changed = self.config.bindings != config.bindings;
@@ -796,6 +772,111 @@ impl App {
 }
 
 #[cfg(test)]
+mod command_tests {
+    use super::*;
+    use platform::ActivationResult;
+
+    fn key(pid: u32) -> ClientKey {
+        ClientKey {
+            hwnd: 1,
+            pid,
+            created: 2,
+        }
+    }
+
+    #[test]
+    fn switches_refresh_on_switch_or_when_rotation_is_empty() {
+        for mode in [
+            RefreshMode::Manual,
+            RefreshMode::Periodic,
+            RefreshMode::OnSwitch,
+        ] {
+            assert!(should_refresh_for_switch(mode, true));
+            assert_eq!(
+                should_refresh_for_switch(mode, false),
+                mode == RefreshMode::OnSwitch
+            );
+        }
+    }
+
+    #[test]
+    fn activation_results_must_match_the_pending_client() {
+        let now = Instant::now();
+        let mut state = ActivationState::default();
+        assert_eq!(
+            state.result(key(1), ActivationResult::Stale),
+            ActivationDecision::Ignore
+        );
+        state.request(key(1), Some(false), now);
+        assert_eq!(
+            state.result(key(2), ActivationResult::Stale),
+            ActivationDecision::Ignore
+        );
+        assert_eq!(state.pending, Some((key(1), Some(false), now)));
+        assert_eq!(
+            state.result(key(1), ActivationResult::Activated),
+            ActivationDecision::Complete
+        );
+        assert_eq!(state.pending, None);
+        assert_eq!(
+            state.result(key(1), ActivationResult::Activated),
+            ActivationDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn stale_activation_retries_once_in_the_requested_direction() {
+        for previous in [false, true] {
+            let now = Instant::now();
+            let mut state = ActivationState::default();
+            state.request(key(1), Some(previous), now);
+            let decision = state.result(key(1), ActivationResult::Stale);
+            assert_eq!(decision, ActivationDecision::Retry { previous });
+            assert_eq!(state.pending, None);
+            state.request(key(2), None, now);
+            assert_eq!(
+                state.result(key(2), ActivationResult::Stale),
+                ActivationDecision::Complete
+            );
+            assert_eq!(state.pending, None);
+        }
+    }
+
+    #[test]
+    fn non_stale_activation_results_do_not_retry() {
+        for result in [
+            ActivationResult::Activated,
+            ActivationResult::ForegroundDenied,
+            ActivationResult::TimedOut,
+        ] {
+            let mut state = ActivationState::default();
+            state.request(key(1), Some(true), Instant::now());
+            assert_eq!(state.result(key(1), result), ActivationDecision::Complete);
+            assert_eq!(state.pending, None);
+        }
+    }
+
+    #[test]
+    fn activation_expires_at_500_ms_and_is_dropped() {
+        let started = Instant::now();
+        let mut state = ActivationState::default();
+        state.request(key(1), Some(false), started);
+        assert_eq!(state.expire(started + Duration::from_millis(499)), None);
+        assert_eq!(state.pending, Some((key(1), Some(false), started)));
+        assert_eq!(
+            state.expire(started + Duration::from_millis(500)),
+            Some(key(1))
+        );
+        assert_eq!(state.pending, None);
+        assert_eq!(state.expire(started + Duration::from_millis(501)), None);
+        assert_eq!(
+            state.result(key(1), ActivationResult::Stale),
+            ActivationDecision::Ignore
+        );
+    }
+}
+
+#[cfg(test)]
 mod owner_tests {
     use super::*;
 
@@ -818,23 +899,6 @@ mod owner_tests {
         }
     }
 
-    fn dispatch_wakeup(hwnd: HWND) {
-        unsafe {
-            let mut message = MSG::default();
-            assert_ne!(
-                PeekMessageW(
-                    &mut message,
-                    hwnd,
-                    OWNER_DISPATCH,
-                    OWNER_DISPATCH,
-                    PM_REMOVE
-                ),
-                0
-            );
-            DispatchMessageW(&message);
-        }
-    }
-
     #[test]
     fn owner_routes_sent_and_posted_notifications_without_popup_reentry() {
         let mut owner = owner();
@@ -846,7 +910,6 @@ mod owner_tests {
                 WM_LBUTTONDBLCLK as LPARAM,
             );
         }
-        dispatch_wakeup(owner.hwnd);
         assert_eq!(
             owner.next_event(),
             Some(OwnerEvent::Tray(TrayCallback::OpenSettings))
@@ -858,7 +921,6 @@ mod owner_tests {
             1,
             WM_RBUTTONUP as LPARAM,
         );
-        dispatch_wakeup(owner.hwnd);
         assert_eq!(
             owner.next_event(),
             Some(OwnerEvent::Tray(TrayCallback::OpenContextMenu))
@@ -883,7 +945,6 @@ mod owner_tests {
         assert_eq!(owner.next_event(), None);
 
         dispatch_posted(owner.hwnd, owner.state.restart_message, 0, 0);
-        dispatch_wakeup(owner.hwnd);
         assert_eq!(owner.next_event(), Some(OwnerEvent::RestoreTray));
 
         unsafe {
@@ -894,7 +955,6 @@ mod owner_tests {
             SendMessageW(owner.hwnd, owner.state.restart_message, 0, 0);
             SendMessageW(owner.hwnd, WM_CLOSE, 0, 0);
         }
-        dispatch_wakeup(owner.hwnd);
         assert_eq!(owner.next_event(), Some(OwnerEvent::Close));
     }
 
@@ -903,24 +963,22 @@ mod owner_tests {
         let mut state = OwnerState::new(WM_APP + 4);
         state.enqueue(OwnerEvent::RestoreTray);
         state.enqueue(OwnerEvent::Tray(TrayCallback::OpenSettings));
-        assert!(!state.enqueue(OwnerEvent::Close));
+        state.enqueue(OwnerEvent::Close);
         assert_eq!(state.events, VecDeque::from([OwnerEvent::Close]));
-        assert!(!state.enqueue(OwnerEvent::Tick));
+        state.enqueue(OwnerEvent::Tick);
         assert_eq!(state.events, VecDeque::from([OwnerEvent::Close]));
         assert!(!state.may_dispatch_menu_command());
     }
 
     #[test]
     fn close_and_cancelmode_end_only_an_active_popup() {
-        assert!(should_end_popup(true, false, WM_CLOSE));
-        assert!(should_end_popup(true, false, WM_CANCELMODE));
-        assert!(!should_end_popup(true, true, WM_CANCELMODE));
-        assert!(!should_end_popup(false, false, WM_CLOSE));
-        assert!(!should_end_popup(false, false, WM_CANCELMODE));
+        assert!(should_end_popup(true, false));
+        assert!(!should_end_popup(true, true));
+        assert!(!should_end_popup(false, false));
 
         let mut state = OwnerState::new(WM_APP + 4);
         state.popup_active = true;
-        assert!(state.request_popup_end(WM_CANCELMODE));
-        assert!(!state.request_popup_end(WM_CLOSE));
+        assert!(state.request_popup_end());
+        assert!(!state.request_popup_end());
     }
 }

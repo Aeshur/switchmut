@@ -1,12 +1,10 @@
 //! Windows window activation helpers.
 
 use crate::clients::{ClientKey, is_live};
-use std::thread;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use std::{
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
-    thread::JoinHandle,
-};
 
 const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FOREGROUND_POLL_LIMIT: Duration = Duration::from_millis(250);
@@ -19,23 +17,29 @@ pub enum ActivationResult {
     TimedOut,
 }
 
-/// Runs the potentially slow foreground acknowledgement away from the owner
-/// message loop. The bounded request channel makes repeated commands explicit:
-/// one request may be in flight and one queued request is retained at most.
+#[derive(Default)]
+struct PendingRequest {
+    next: Option<ClientKey>,
+    closed: bool,
+}
+
+/// Activation thread that waits for foreground acknowledgement off the owner message loop.
+/// A newer request replaces any unstarted one, so a burst of commands ends on the latest target.
 pub struct ActivationWorker {
-    sender: Option<SyncSender<ClientKey>>,
+    pending: Arc<(Mutex<PendingRequest>, Condvar)>,
     results: Receiver<(ClientKey, ActivationResult)>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ActivationWorker {
     pub fn start() -> Result<Self, String> {
-        let (sender, requests) = mpsc::sync_channel(1);
+        let pending = Arc::new((Mutex::new(PendingRequest::default()), Condvar::new()));
         let (results, result_receiver) = mpsc::channel();
+        let worker_pending = Arc::clone(&pending);
         let worker = thread::Builder::new()
             .name("switchmut-activation".to_owned())
             .spawn(move || {
-                while let Ok(key) = requests.recv() {
+                while let Some(key) = next_request(&worker_pending) {
                     let result = activate(key);
                     if results.send((key, result)).is_err() {
                         break;
@@ -44,20 +48,17 @@ impl ActivationWorker {
             })
             .map_err(|error| format!("could not start the activation worker: {error}"))?;
         Ok(Self {
-            sender: Some(sender),
+            pending,
             results: result_receiver,
             worker: Some(worker),
         })
     }
 
-    pub fn request(&self, key: ClientKey) -> bool {
-        let Some(sender) = &self.sender else {
-            return false;
-        };
-        match sender.try_send(key) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-        }
+    /// Queue `key`, replacing any request the worker has not started yet.
+    pub fn request(&self, key: ClientKey) {
+        let (lock, wake) = &*self.pending;
+        lock.lock().unwrap_or_else(PoisonError::into_inner).next = Some(key);
+        wake.notify_one();
     }
 
     pub fn try_result(&self) -> Option<(ClientKey, ActivationResult)> {
@@ -65,9 +66,25 @@ impl ActivationWorker {
     }
 }
 
+fn next_request(pending: &(Mutex<PendingRequest>, Condvar)) -> Option<ClientKey> {
+    let (lock, wake) = pending;
+    let mut pending = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if let Some(key) = pending.next.take() {
+            return Some(key);
+        }
+        if pending.closed {
+            return None;
+        }
+        pending = wake.wait(pending).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
 impl Drop for ActivationWorker {
     fn drop(&mut self) {
-        self.sender.take();
+        let (lock, wake) = &*self.pending;
+        lock.lock().unwrap_or_else(PoisonError::into_inner).closed = true;
+        wake.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -78,24 +95,6 @@ impl Drop for ActivationWorker {
 /// foreground. Every input queue attached for the activation attempt is
 /// detached before foreground polling begins.
 pub fn activate(key: ClientKey) -> ActivationResult {
-    #[cfg(windows)]
-    {
-        activate_windows(key)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = key;
-        ActivationResult::Stale
-    }
-}
-
-/// Encode a nul-terminated UTF-16 string for Win32 APIs.
-pub fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(windows)]
-fn activate_windows(key: ClientKey) -> ActivationResult {
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetActiveWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -152,11 +151,7 @@ fn activate_windows(key: ClientKey) -> ActivationResult {
             return ActivationResult::Stale;
         }
         if unsafe { GetForegroundWindow() } == hwnd && unsafe { IsIconic(hwnd) } == 0 {
-            return if is_live(key) {
-                ActivationResult::Activated
-            } else {
-                ActivationResult::Stale
-            };
+            return ActivationResult::Activated;
         }
         if start.elapsed() >= FOREGROUND_POLL_LIMIT {
             return if foreground_call_ok {
@@ -169,12 +164,10 @@ fn activate_windows(key: ClientKey) -> ActivationResult {
     }
 }
 
-#[cfg(windows)]
 struct InputAttachment {
     attached: Option<(u32, u32)>,
 }
 
-#[cfg(windows)]
 impl InputAttachment {
     fn attach(current_thread: u32, other_thread: u32) -> Self {
         use windows_sys::Win32::System::Threading::AttachThreadInput;
@@ -187,7 +180,6 @@ impl InputAttachment {
     }
 }
 
-#[cfg(windows)]
 impl Drop for InputAttachment {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Threading::AttachThreadInput;
@@ -278,9 +270,25 @@ impl Drop for PaintBuffer {
 mod tests {
     use super::*;
 
+    fn key(hwnd: isize) -> ClientKey {
+        ClientKey {
+            hwnd,
+            pid: 1,
+            created: 1,
+        }
+    }
+
     #[test]
-    fn wide_encoding_includes_one_terminator() {
-        assert_eq!(wide("A").as_slice(), &[b'A' as u16, 0]);
-        assert_eq!(wide("").as_slice(), &[0]);
+    fn newer_request_replaces_a_queued_one_and_close_ends_the_queue() {
+        let worker = ActivationWorker {
+            pending: Arc::new((Mutex::new(PendingRequest::default()), Condvar::new())),
+            results: mpsc::channel().1,
+            worker: None,
+        };
+        worker.request(key(1));
+        worker.request(key(2));
+        assert_eq!(next_request(&worker.pending), Some(key(2)));
+        worker.pending.0.lock().unwrap().closed = true;
+        assert_eq!(next_request(&worker.pending), None);
     }
 }

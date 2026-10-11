@@ -90,5 +90,8 @@ fn main() {
     println!("cargo:rustc-link-arg-bin=Switchmut=/MANIFEST:EMBED");
     println!("cargo:rustc-link-arg-bin=Switchmut=/MANIFESTINPUT:{root}/assets/app.manifest");
     println!("cargo:rustc-link-arg-bin=Switchmut=/MANIFESTUAC:NO");
+    println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg-tests=/MANIFESTINPUT:{root}/assets/app.manifest");
+    println!("cargo:rustc-link-arg-tests=/MANIFESTUAC:NO");
     println!("cargo:rustc-link-arg-bin=Switchmut=/Brepro");
 }

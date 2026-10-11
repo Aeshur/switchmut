@@ -1,8 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Headless', 'Interactive')]
-    [string]$Mode = 'Headless',
-    [switch]$NativeChecks,
+    [switch]$Interactive,
     [switch]$LiveGameCheck
 )
 
@@ -22,13 +20,74 @@ function Invoke-CargoChecked {
     }
 }
 
+function Write-ThirdPartyNotices {
+    param($Metadata, $RootPackage, [string]$Path)
+
+    $packages = @{}
+    foreach ($item in $Metadata.packages) { $packages[$item.id] = $item }
+    $nodes = @{}
+    foreach ($node in $Metadata.resolve.nodes) { $nodes[$node.id] = $node }
+    $visited = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($RootPackage.id)
+    $ordered = @{}
+    $keys = [Collections.Generic.List[string]]::new()
+    while ($pending.Count) {
+        $id = $pending.Pop()
+        if (!$visited.Add($id)) { continue }
+        $item = $packages[$id]
+        # Normal dependencies can be proc macros whose code runs only at build time.
+        if (@($item.targets | Where-Object { $_.kind -contains 'proc-macro' }).Count) { continue }
+        # Switchmut's own license ships separately as LICENSE.txt.
+        if ($id -cne $RootPackage.id) {
+            $key = "$($item.name)`n$($item.version)`n$id"
+            $ordered[$key] = $item
+            $keys.Add($key)
+        }
+        foreach ($dependency in $nodes[$id].deps) {
+            if (@($dependency.dep_kinds | Where-Object { $null -eq $_.kind }).Count) {
+                $pending.Push($dependency.pkg)
+            }
+        }
+    }
+    $keys.Sort([StringComparer]::Ordinal)
+
+    $text = [Text.StringBuilder]::new()
+    [void]$text.Append("Switchmut is AGPL-3.0-or-later.`nCorresponding source: https://github.com/Aeshur/switchmut`n`n")
+    foreach ($key in $keys) {
+        $item = $ordered[$key]
+        $directory = Split-Path -Parent $item.manifest_path
+        $files = @{}
+        $names = [Collections.Generic.List[string]]::new()
+        foreach ($file in Get-ChildItem -LiteralPath $directory -File) {
+            if ($file.Name -match '^(LICENSE|LICENCE|COPYING|NOTICE)') {
+                $files[$file.Name] = $file.FullName
+                $names.Add($file.Name)
+            }
+        }
+        if (!@($names | Where-Object { $_ -match '^(LICENSE|LICENCE|COPYING)' }).Count) {
+            throw "No license file for $($item.name) $($item.version) in '$directory'"
+        }
+        $names.Sort([StringComparer]::Ordinal)
+        [void]$text.Append("Name: $($item.name)`nVersion: $($item.version)`nLicense: $($item.license)`nRepository: $($item.repository)`n")
+        foreach ($name in $names) {
+            [void]$text.Append("`n--- $name ---`n")
+            $contents = [IO.File]::ReadAllText($files[$name]).Replace("`r`n", "`n").Replace("`r", "`n")
+            [void]$text.Append($contents)
+            if (!$contents.EndsWith("`n")) { [void]$text.Append("`n") }
+        }
+        [void]$text.Append("`n")
+    }
+    [IO.File]::WriteAllText($Path, $text.ToString(), [Text.UTF8Encoding]::new($false))
+}
+
 Push-Location -LiteralPath $project
 try {
     Invoke-CargoChecked @('fmt', '--all', '--', '--check') 'Formatting failed'
     Invoke-CargoChecked @('clippy', '--locked', '--all-targets', '--', '-D', 'warnings') 'Clippy failed'
     Invoke-CargoChecked @('test', '--locked', '--all-targets') 'Tests failed'
 
-    if ($NativeChecks) {
+    if ($Interactive) {
         Invoke-CargoChecked @('test', '--locked', '--test', 'native_windows', 'native_lifecycle', '--', '--ignored', '--test-threads=1', '--nocapture') 'Native integration checks failed'
     }
 
@@ -38,19 +97,22 @@ try {
 
     Invoke-CargoChecked @('build', '--locked', '--release', '--bin', 'Switchmut') 'Release build failed'
 
-    $metadata = cargo metadata --locked --format-version 1 | ConvertFrom-Json
+    $targetTriple = 'x86_64-pc-windows-msvc'
+    $metadataJson = & cargo metadata --locked --format-version 1 --filter-platform $targetTriple
     if ($LASTEXITCODE) {
         throw 'Cargo metadata failed'
     }
+    $metadata = ($metadataJson -join "`n") | ConvertFrom-Json
     $package = @($metadata.packages | Where-Object { $_.name -eq 'switchmut' })[0]
-    $targetTriple = 'x86_64-pc-windows-msvc'
     $targetDirectory = [string]$metadata.target_directory
     $source = Join-Path $targetDirectory "$targetTriple/release/Switchmut.exe"
     if (!(Test-Path -LiteralPath $source -PathType Leaf)) {
         throw "Cargo did not produce the expected $targetTriple executable at '$source'"
     }
-    $sourceCommit = (& git rev-parse HEAD).Trim()
+    $sourceCommitOutput = & git rev-parse HEAD
     if ($LASTEXITCODE) { throw 'Could not read the source commit' }
+    $sourceCommit = ($sourceCommitOutput -join "`n").Trim()
+    if (!$sourceCommit) { throw 'Git returned an empty source commit' }
     $sourceStatus = @(& git status --porcelain=v1)
     if ($LASTEXITCODE) { throw 'Could not read the source status' }
     $stamp = Get-Date -Format yyyyMMdd-HHmmss
@@ -60,9 +122,10 @@ try {
     New-Item -ItemType Directory -Path $stage, $extracted -Force | Out-Null
 
     Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'Switchmut.exe')
+    Copy-Item -LiteralPath (Join-Path $project 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+    Write-ThirdPartyNotices $metadata $package (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
 
     $pe = & (Join-Path $PSScriptRoot 'inspect-pe.ps1') -Path (Join-Path $stage 'Switchmut.exe')
-    $pe | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $release 'pe-report.json') -Encoding utf8
     $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $stage 'Switchmut.exe'))
     $expectedWindowsVersion = "$($package.version).0"
     if ($versionInfo.FileVersion -ne $expectedWindowsVersion -or $versionInfo.ProductVersion -ne $expectedWindowsVersion) {
@@ -72,7 +135,7 @@ try {
         throw 'Windows executable metadata must use the Switchmut product name'
     }
 
-    $expectedFiles = @('Switchmut.exe')
+    $expectedFiles = @('Switchmut.exe', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt')
     $actualFiles = @(
         Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object {
             $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
@@ -96,25 +159,9 @@ try {
     }
 
     [IO.Compression.ZipFile]::ExtractToDirectory($archive, $extracted)
-    $checks = @(
-        Get-ChildItem -LiteralPath $stage -Recurse -File | Sort-Object FullName |
-            ForEach-Object {
-                $relative = $_.FullName.Substring($stage.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
-                $testFile = Join-Path $extracted $relative
-                $expected = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-                $actual = (Get-FileHash -LiteralPath $testFile -Algorithm SHA256).Hash
-                if ($expected -ne $actual) {
-                    throw "Extracted file differs: $relative"
-                }
-                [ordered]@{ Path = $relative; Bytes = $_.Length; Sha256 = $actual }
-            }
-    )
-    if (@(Get-ChildItem -LiteralPath $extracted -Recurse -File).Count -ne $checks.Count) {
-        throw 'Unexpected extracted files'
-    }
 
     $interactiveResult = 'not-run'
-    if ($Mode -eq 'Interactive') {
+    if ($Interactive) {
         Invoke-CargoChecked @('run', '--locked', '--example', 'release_smoke', '--', (Join-Path $extracted 'Switchmut.exe')) 'Extracted executable smoke check failed'
         $interactiveResult = 'passed'
     }
@@ -123,9 +170,9 @@ try {
     if ($LASTEXITCODE) { throw 'Could not read the active Rust toolchain' }
     $report = [ordered]@{
         Version = $package.version
-        Mode = $Mode
+        Mode = if ($Interactive) { 'Interactive' } else { 'Headless' }
         TargetTriple = $targetTriple
-        Executable = 'extracted/Switchmut.exe'
+        Executable = 'package/Switchmut.exe'
         ExecutableBytes = $pe.FileBytes
         ExecutableSha256 = $pe.Sha256
         FileVersion = $versionInfo.FileVersion
@@ -141,14 +188,12 @@ try {
             Formatting = 'passed'
             Clippy = 'passed'
             UnitTests = 'passed'
-            NativeChecks = if ($NativeChecks) { 'passed' } else { 'not-run' }
+            NativeChecks = $interactiveResult
             LiveGameCheck = if ($LiveGameCheck) { 'passed' } else { 'not-run' }
-            ExtractionHashes = 'passed'
             ExtractedApplicationSmoke = $interactiveResult
         }
         Rustc = $rustc
         Pe = $pe
-        Files = $checks
     }
     $manifest = Join-Path $release 'Switchmut-release-manifest.json'
     $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8

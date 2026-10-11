@@ -19,7 +19,6 @@ pub struct ClientKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Client {
     pub key: ClientKey,
-    pub class: String,
     pub title: String,
     pub allowed: bool,
 }
@@ -48,10 +47,7 @@ struct ImageMetadata {
 impl ImageMetadata {
     fn read(path: &Path) -> std::io::Result<Self> {
         let metadata = fs::metadata(path)?;
-        #[cfg(windows)]
         let native = native_file_metadata(path).ok();
-        #[cfg(not(windows))]
-        let native = None;
         Ok(Self {
             size: metadata.len(),
             modified: metadata.modified().ok(),
@@ -157,7 +153,6 @@ fn normalized_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(&normalized))
 }
 
-#[cfg(windows)]
 fn native_file_metadata(path: &Path) -> std::io::Result<(u64, i64, (u64, [u8; 16]))> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -203,67 +198,34 @@ impl Discovery {
     /// Enumerate visible top-level windows belonging to an exact supported image.
     /// Existing allow/deny decisions are managed by `switching::Rotation`.
     pub fn refresh(&mut self) -> Vec<Client> {
-        #[cfg(windows)]
-        {
-            refresh_windows(&mut self.identities)
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+        use windows_sys::core::BOOL;
+
+        unsafe extern "system" fn visit(hwnd: HWND, context: LPARAM) -> BOOL {
+            let context = unsafe { &mut *(context as *mut EnumerationContext<'_>) };
+            unsafe { visit_window(hwnd as isize, context) };
+            1
         }
-        #[cfg(not(windows))]
-        {
-            let _ = &mut self.identities;
-            Vec::new()
+
+        let mut context = EnumerationContext {
+            clients: Vec::new(),
+            identities: &mut self.identities,
+            processes: HashMap::new(),
+            verified: HashMap::new(),
+            seen_paths: HashSet::new(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(visit),
+                &mut context as *mut EnumerationContext<'_> as LPARAM,
+            );
         }
+        context.identities.keep_only(&context.seen_paths);
+        context.clients
     }
 }
 
-/// Verify that a stored window identity still names the same live process.
-pub fn is_live(key: ClientKey) -> bool {
-    #[cfg(windows)]
-    {
-        is_live_windows(key)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = key;
-        false
-    }
-}
-
-#[cfg(windows)]
-fn refresh_windows(identities: &mut IdentityCache) -> Vec<Client> {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
-    use windows_sys::core::BOOL;
-
-    unsafe extern "system" fn visit(hwnd: HWND, context: LPARAM) -> BOOL {
-        let context = unsafe { &mut *(context as *mut EnumerationContext<'_>) };
-        let outcome = catch_unwind(AssertUnwindSafe(|| unsafe {
-            visit_window(hwnd as isize, context)
-        }));
-        if outcome.is_err() {
-            return 1;
-        }
-        1
-    }
-
-    let mut context = EnumerationContext {
-        clients: Vec::new(),
-        identities,
-        processes: HashMap::new(),
-        verified: HashMap::new(),
-        seen_paths: HashSet::new(),
-    };
-    unsafe {
-        EnumWindows(
-            Some(visit),
-            &mut context as *mut EnumerationContext<'_> as LPARAM,
-        );
-    }
-    context.identities.keep_only(&context.seen_paths);
-    context.clients
-}
-
-#[cfg(windows)]
 unsafe fn visit_window(hwnd: isize, context: &mut EnumerationContext<'_>) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetParent, GetWindowThreadProcessId, IsWindowVisible,
@@ -284,12 +246,15 @@ unsafe fn visit_window(hwnd: isize, context: &mut EnumerationContext<'_>) {
     };
     let path_key = cache_path(&process.path);
     context.seen_paths.insert(path_key.clone());
-    let supported = context
-        .verified
-        .get(&path_key)
-        .copied()
-        .unwrap_or_else(|| context.identities.check(&process.path));
-    context.verified.insert(path_key, supported);
+    // IdentityCache cannot store files without stable IDs; cache each path's verdict for this pass.
+    let supported = match context.verified.get(&path_key) {
+        Some(&supported) => supported,
+        None => {
+            let supported = context.identities.check(&process.path);
+            context.verified.insert(path_key, supported);
+            supported
+        }
+    };
     if !supported {
         return;
     }
@@ -300,19 +265,16 @@ unsafe fn visit_window(hwnd: isize, context: &mut EnumerationContext<'_>) {
             pid,
             created: process.created,
         },
-        class: window_class(hwnd as isize),
         title: window_title(hwnd as isize),
         allowed: true,
     });
 }
 
-#[cfg(windows)]
 struct ProcessInfo {
     path: PathBuf,
     created: u64,
 }
 
-#[cfg(windows)]
 struct EnumerationContext<'a> {
     clients: Vec<Client>,
     identities: &'a mut IdentityCache,
@@ -321,7 +283,6 @@ struct EnumerationContext<'a> {
     seen_paths: HashSet<PathBuf>,
 }
 
-#[cfg(windows)]
 impl EnumerationContext<'_> {
     fn process(&mut self, pid: u32) -> Option<ProcessInfo> {
         self.processes
@@ -335,16 +296,6 @@ impl EnumerationContext<'_> {
     }
 }
 
-#[cfg(windows)]
-fn window_class(hwnd: isize) -> String {
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
-    let mut buffer = [0u16; 512];
-    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
-    let count = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
-    String::from_utf16_lossy(&buffer[..count.max(0) as usize])
-}
-
-#[cfg(windows)]
 fn window_title(hwnd: isize) -> String {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
@@ -354,25 +305,44 @@ fn window_title(hwnd: isize) -> String {
     String::from_utf16_lossy(&buffer[..count.max(0) as usize])
 }
 
-#[cfg(windows)]
-fn query_process(pid: u32) -> Option<ProcessInfo> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-    };
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
 
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return None;
+impl ProcessHandle {
+    fn open(pid: u32) -> Option<Self> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        (!handle.is_null()).then_some(Self(handle))
     }
-    struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for ProcessHandle {
-        fn drop(&mut self) {
-            unsafe { CloseHandle(self.0) };
+
+    /// Creation time in FILETIME ticks; zero is rejected.
+    fn creation_time(&self) -> Option<u64> {
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let mut created = unsafe { std::mem::zeroed() };
+        let mut exited = unsafe { std::mem::zeroed() };
+        let mut kernel = unsafe { std::mem::zeroed() };
+        let mut user = unsafe { std::mem::zeroed() };
+        if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+            == 0
+        {
+            return None;
         }
+        let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        (created != 0).then_some(created)
     }
-    let process = ProcessHandle(process);
+}
 
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+fn query_process(pid: u32) -> Option<ProcessInfo> {
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+    let process = ProcessHandle::open(pid)?;
     let mut path = vec![0u16; 32_768];
     let mut path_length = path.len() as u32;
     if unsafe { QueryFullProcessImageNameW(process.0, 0, path.as_mut_ptr(), &mut path_length) } == 0
@@ -380,17 +350,8 @@ fn query_process(pid: u32) -> Option<ProcessInfo> {
         return None;
     }
     path.truncate(path_length as usize);
-
-    let mut created = unsafe { std::mem::zeroed() };
-    let mut exited = unsafe { std::mem::zeroed() };
-    let mut kernel = unsafe { std::mem::zeroed() };
-    let mut user = unsafe { std::mem::zeroed() };
-    if unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
-    {
-        return None;
-    }
-    let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
-    if created == 0 || path.is_empty() {
+    let created = process.creation_time()?;
+    if path.is_empty() {
         return None;
     }
     Some(ProcessInfo {
@@ -399,11 +360,8 @@ fn query_process(pid: u32) -> Option<ProcessInfo> {
     })
 }
 
-#[cfg(windows)]
-fn is_live_windows(key: ClientKey) -> bool {
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+/// Check the window's PID and process creation time to reject reused identities.
+pub fn is_live(key: ClientKey) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
 
     let hwnd = key.hwnd as windows_sys::Win32::Foundation::HWND;
@@ -414,27 +372,9 @@ fn is_live_windows(key: ClientKey) -> bool {
     if unsafe { GetWindowThreadProcessId(hwnd, &mut pid) } == 0 || pid != key.pid {
         return false;
     }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, key.pid) };
-    if process.is_null() {
-        return false;
-    }
-    struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for ProcessHandle {
-        fn drop(&mut self) {
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-        }
-    }
-    let process = ProcessHandle(process);
-    let mut created = unsafe { std::mem::zeroed() };
-    let mut exited = unsafe { std::mem::zeroed() };
-    let mut kernel = unsafe { std::mem::zeroed() };
-    let mut user = unsafe { std::mem::zeroed() };
-    if unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
-    {
-        return false;
-    }
-    let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
-    created != 0 && created == key.created
+    ProcessHandle::open(key.pid)
+        .and_then(|process| process.creation_time())
+        .is_some_and(|created| created == key.created)
 }
 
 #[cfg(test)]

@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 #[path = "../examples/support/mod.rs"]
 mod support;
 
@@ -24,16 +22,80 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::{LibraryLoader::GetModuleHandleW, Threading::*},
+        System::{
+            LibraryLoader::{
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW, GetModuleHandleW,
+                GetProcAddress,
+            },
+            Threading::*,
+        },
         UI::{
-            HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
+            Controls::{ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx},
+            HiDpi::{
+                AdjustWindowRectExForDpi, AreDpiAwarenessContextsEqual,
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetAwarenessFromDpiAwarenessContext,
+                GetDpiForWindow, GetThreadDpiAwarenessContext,
+            },
             Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN, VK_TAB},
-            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            Shell::{
+                DLLGETVERSIONPROC, DLLVERSIONINFO, DefSubclassProc, RemoveWindowSubclass,
+                SetWindowSubclass,
+            },
             WindowsAndMessaging::*,
         },
     },
     core::w,
 };
+
+fn init_shipped_environment() {
+    unsafe {
+        let context = GetThreadDpiAwarenessContext();
+        let per_monitor_v2 =
+            AreDpiAwarenessContextsEqual(context, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
+        // Use the imported function's module because multiple comctl32 versions may be loaded.
+        let mut module = null_mut();
+        assert_ne!(
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                InitCommonControlsEx as *const () as *const u16,
+                &mut module,
+            ),
+            0
+        );
+        let get_version: DLLGETVERSIONPROC =
+            std::mem::transmute(GetProcAddress(module, c"DllGetVersion".as_ptr().cast()));
+        let mut version = DLLVERSIONINFO {
+            cbSize: size_of::<DLLVERSIONINFO>() as u32,
+            ..std::mem::zeroed()
+        };
+        assert_eq!(
+            get_version.expect("comctl32 exports DllGetVersion")(&mut version),
+            0
+        );
+        assert!(
+            per_monitor_v2 && version.dwMajorVersion >= 6,
+            "shipped manifest must enable PerMonitorV2 and Common Controls v6: \
+             PerMonitorV2={per_monitor_v2}, DPI awareness={}, comctl32={}.{}",
+            GetAwarenessFromDpiAwarenessContext(context),
+            version.dwMajorVersion,
+            version.dwMinorVersion,
+        );
+        assert_ne!(
+            InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_STANDARD_CLASSES,
+            }),
+            0,
+            "initialize the same standard control classes as app::run"
+        );
+        println!(
+            "shipped environment: PerMonitorV2={per_monitor_v2}, comctl32={}.{}",
+            version.dwMajorVersion, version.dwMinorVersion
+        );
+    }
+}
 
 #[test]
 fn legacy_tray_callback_decodes_shell_mouse_message_from_lparam() {
@@ -462,11 +524,14 @@ fn fixture_server() {
         SetTimer(hwnd, 1, 60_000, None);
     }
     let identity = key(hwnd);
+    let path = PathBuf::from(path);
+    let temporary = path.with_extension("tmp");
     std::fs::write(
-        path,
+        &temporary,
         format!("{} {} {}", identity.hwnd, identity.pid, identity.created),
     )
     .unwrap();
+    std::fs::rename(temporary, path).unwrap();
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -479,6 +544,7 @@ fn fixture_server() {
 #[test]
 #[ignore = "Creates real foreground windows; run explicitly on an interactive Windows desktop"]
 fn native_lifecycle() {
+    init_shipped_environment();
     let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-artifacts/native");
     std::fs::create_dir_all(&scratch).unwrap();
     let nonce = std::time::SystemTime::now()
@@ -518,7 +584,6 @@ fn native_lifecycle() {
     let mut rotation = Rotation::default();
     rotation.reconcile(vec![Client {
         key: target_key,
-        class: "fixture".into(),
         title: "fixture".into(),
         allowed: true,
     }]);
@@ -579,13 +644,11 @@ fn native_lifecycle() {
             vec![
                 Client {
                     key: target_key,
-                    class: "fixture-class".into(),
                     title: "A long fixture title for the compact client list".into(),
                     allowed: true,
                 },
                 Client {
                     key: other,
-                    class: "fixture-class".into(),
                     title: "Other fixture client".into(),
                     allowed: true,
                 },
@@ -597,6 +660,7 @@ fn native_lifecycle() {
         let settings_hwnd = settings.hwnd();
         assert_eq!(text(settings_hwnd), "Switchmut");
         let dpi = unsafe { GetDpiForWindow(settings_hwnd).max(96) };
+        let px = |value: i32| value * dpi as i32 / 96;
         let mut initial_client = RECT::default();
         unsafe {
             GetClientRect(settings_hwnd, &mut initial_client);
@@ -798,7 +862,10 @@ fn native_lifecycle() {
             HTCLIENT as isize,
             "title buttons remain clickable in the draggable header"
         );
-        let mut drag_point = POINT { x: 120, y: 15 };
+        let mut drag_point = POINT {
+            x: px(120),
+            y: px(15),
+        };
         unsafe {
             ClientToScreen(settings_hwnd, &mut drag_point);
         }
@@ -842,12 +909,12 @@ fn native_lifecycle() {
         let settings_dc = unsafe { GetDC(settings_hwnd) };
         assert!(!settings_dc.is_null());
         assert_eq!(
-            unsafe { GetPixel(settings_dc, 210, 15) },
+            unsafe { GetPixel(settings_dc, px(210), px(15)) },
             0x00593b05,
             "native title area paints the Bahamut topbar color"
         );
         assert_eq!(
-            unsafe { GetPixel(settings_dc, 280, 90) },
+            unsafe { GetPixel(settings_dc, px(280), px(90)) },
             0x006e4e05,
             "General page paints its blue client section"
         );
@@ -907,7 +974,7 @@ fn native_lifecycle() {
             pump(Duration::from_millis(10));
             let dc = unsafe { GetDC(settings_hwnd) };
             assert_eq!(
-                unsafe { GetPixel(dc, x, y) },
+                unsafe { GetPixel(dc, px(x), px(y)) },
                 0x006e4e05,
                 "{page} page paints its blue section"
             );
@@ -1466,10 +1533,11 @@ fn native_lifecycle() {
     }
     status_lifecycle();
     let process = unsafe { GetCurrentProcess() };
+    let mut warm_counts = None;
     // Warm up Windows' lazy control/GDI allocations before comparing resource counts.
     for iteration in 0..25 {
         let settings = Settings::new(config.clone(), Vec::new(), None, Vec::new()).unwrap();
-        let mut menu = Radial::new(config.menu.clone(), Some(target_key));
+        let mut menu = Radial::new(Some(target_key));
         menu.open();
         menu.update_axes(32767, 0);
         pump(Duration::from_millis(25));
@@ -1484,18 +1552,10 @@ fn native_lifecycle() {
             GetProcessHandleCount(process, &mut handles);
         }
         if iteration == 2 {
-            std::fs::write(
-                scratch.join("warm-counts.txt"),
-                format!("{gdi} {user} {handles}"),
-            )
-            .unwrap();
+            warm_counts = Some([gdi, user, handles]);
         }
         if iteration == 24 {
-            let before = std::fs::read_to_string(scratch.join("warm-counts.txt")).unwrap();
-            let counts: Vec<u32> = before
-                .split_whitespace()
-                .map(|x| x.parse().unwrap())
-                .collect();
+            let counts = warm_counts.expect("iteration 2 recorded resource counts");
             assert!(
                 gdi <= counts[0] + 2,
                 "GDI resources accumulated: {} -> {gdi}",
@@ -1519,5 +1579,4 @@ fn native_lifecycle() {
     }
     drop(close);
     assert!(child.wait().unwrap().success());
-    std::fs::write(scratch.join("native-result.txt"),"PASS: separate-process foreground, sole client, minimized restore, stale identity, GDI source pixels, 25 overlay/settings lifecycle cycles\n").unwrap();
 }

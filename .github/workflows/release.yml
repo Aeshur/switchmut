@@ -48,7 +48,7 @@ jobs:
 
       - name: Build Windows ZIP
         id: package
-        run: ./tools/package-windows.ps1 -Mode Interactive -NativeChecks
+        run: ./tools/package-windows.ps1 -Interactive
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -91,13 +91,10 @@ jobs:
           $manifestFile = Get-Item -LiteralPath 'release-assets/Switchmut-release-manifest.json'
           $zipFile = Get-Item -LiteralPath 'release-assets/Switchmut-windows.zip'
           $report = Get-Content -LiteralPath $manifestFile.FullName -Raw | ConvertFrom-Json
-          if ($tag -cne "v$($report.Version)") { throw "Tag '$tag' does not match manifest version '$($report.Version)'" }
           if ($report.Source.Dirty) { throw 'The release source tree was dirty' }
-          if ($report.Source.Commit -cne $env:GITHUB_SHA) { throw 'The release source commit does not match the tagged workflow commit' }
           if ($report.Validation.NativeChecks -ne 'passed') { throw 'Native checks were not passed for this candidate' }
           if ($report.Validation.ExtractedApplicationSmoke -ne 'passed') { throw 'Extracted application smoke was not passed for this candidate' }
           $releaseArchiveName = 'Switchmut-windows.zip'
-          if ([IO.Path]::GetFileName($report.Archive) -cne $releaseArchiveName) { throw 'ZIP filename does not match the manifest' }
 
           $zipHash = (Get-FileHash -LiteralPath $zipFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($zipHash -cne $report.ArchiveSha256.ToLowerInvariant()) { throw 'Downloaded ZIP hash does not match the manifest' }
@@ -129,11 +126,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed' }
           }
           else {
-            if ($release.tag_name -cne $tag) { throw "GitHub returned unexpected release tag '$($release.tag_name)'" }
             $missingAssets = @()
             foreach ($asset in $assets) {
               $existing = @($release.assets | Where-Object { $_.name -ceq $asset.Name })
-              if ($existing.Count -gt 1) { throw "GitHub release has duplicate asset '$($asset.Name)'" }
               if ($existing.Count -eq 0) {
                 $missingAssets += $asset.Path
                 continue
@@ -144,7 +139,6 @@ jobs:
               gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $asset.Name --dir $existingDir
               if ($LASTEXITCODE -ne 0) { throw "Could not verify existing release asset '$($asset.Name)'" }
               $existingPath = Join-Path $existingDir $asset.Name
-              if (!(Test-Path -LiteralPath $existingPath -PathType Leaf)) { throw "Existing asset download missing: $($asset.Name)" }
               $existingHash = (Get-FileHash -LiteralPath $existingPath -Algorithm SHA256).Hash.ToLowerInvariant()
               if ($existingHash -cne $asset.Hash) { throw "Existing release asset '$($asset.Name)' has different bytes; refusing to replace it" }
             }

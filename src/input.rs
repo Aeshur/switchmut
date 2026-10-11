@@ -94,9 +94,6 @@ impl InputWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         control.last_selection_token = control.last_selection_token.wrapping_add(1);
-        if control.last_selection_token == 0 {
-            control.last_selection_token = 1;
-        }
         let token = control.last_selection_token;
         control.selection_request = Some((token, id));
         token
@@ -527,7 +524,6 @@ fn button_mask(count: u8) -> u32 {
     }
 }
 
-#[cfg(windows)]
 fn enumerate_devices() -> Vec<BackendDevice> {
     use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
@@ -550,12 +546,6 @@ fn enumerate_devices() -> Vec<BackendDevice> {
     xinput
 }
 
-#[cfg(not(windows))]
-fn enumerate_devices() -> Vec<BackendDevice> {
-    Vec::new()
-}
-
-#[cfg(windows)]
 fn enumerate_winmm_devices() -> Vec<BackendDevice> {
     use windows_sys::Win32::Media::Multimedia::{JOYCAPSW, joyGetDevCapsW, joyGetNumDevs};
 
@@ -599,7 +589,6 @@ fn enumerate_winmm_devices() -> Vec<BackendDevice> {
     devices
 }
 
-#[cfg(windows)]
 fn poll_device(device: &BackendDevice) -> Option<ControllerState> {
     match device.backend {
         Backend::XInput => poll_xinput(device.index),
@@ -607,12 +596,6 @@ fn poll_device(device: &BackendDevice) -> Option<ControllerState> {
     }
 }
 
-#[cfg(not(windows))]
-fn poll_device(_device: &BackendDevice) -> Option<ControllerState> {
-    None
-}
-
-#[cfg(windows)]
 fn poll_xinput(index: u32) -> Option<ControllerState> {
     use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputGetState};
 
@@ -632,7 +615,6 @@ fn poll_xinput(index: u32) -> Option<ControllerState> {
     })
 }
 
-#[cfg(windows)]
 fn poll_winmm(index: u32, button_count: u8) -> Option<ControllerState> {
     use windows_sys::Win32::Media::Multimedia::{JOYINFOEX, joyGetPosEx};
 

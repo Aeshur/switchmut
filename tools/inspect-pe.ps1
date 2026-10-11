@@ -24,15 +24,10 @@ $count = U16 ($pe + 6)
 $optionalSize = U16 ($pe + 20)
 $optional = $pe + 24
 $magic = U16 $optional
-$directory = if ($magic -eq 0x20b) {
-    $optional + 112
+if ($magic -ne 0x20b) {
+    throw 'Unsupported PE header: expected PE32+'
 }
-elseif ($magic -eq 0x10b) {
-    $optional + 96
-}
-else {
-    throw 'Unsupported PE header'
-}
+$directory = $optional + 112
 $sections = $optional + $optionalSize
 
 function RvaOffset([uint32]$rva) {
@@ -89,7 +84,7 @@ $subsystem = U16 ($optional + 68)
 $unexpected = @(
     $imports |
         Where-Object {
-            $_ -notmatch '^(api-ms-win-|ext-ms-win-|KERNEL32\.dll$|USER32\.dll$|GDI32\.dll$|ADVAPI32\.dll$|SHELL32\.dll$|SHLWAPI\.dll$|OLE32\.dll$|OLEAUT32\.dll$|COMCTL32\.dll$|COMDLG32\.dll$|UXTHEME\.dll$|WINMM\.dll$|XINPUT1_4\.dll$|BCRYPT\.dll$|BCRYPTPRIMITIVES\.dll$|NTDLL\.dll$|USERENV\.dll$|WS2_32\.dll$)'
+            $_ -notmatch '^(api-ms-win-|KERNEL32\.dll$|USER32\.dll$|GDI32\.dll$|SHELL32\.dll$|COMCTL32\.dll$|WINMM\.dll$|XINPUT1_4\.dll$|BCRYPTPRIMITIVES\.dll$|NTDLL\.dll$)'
         }
 )
 
