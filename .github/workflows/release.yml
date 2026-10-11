@@ -23,17 +23,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust toolchain
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $channelLine = Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$' | Select-Object -First 1
-          if (!$channelLine) { throw 'rust-toolchain.toml does not declare a toolchain channel' }
-          $channel = $channelLine.Matches[0].Groups[1].Value
-          rustup toolchain install $channel --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
-          rustup show active-toolchain
-          if ($LASTEXITCODE -ne 0) { throw 'Could not verify the active Rust toolchain' }
-
       - name: Validate tag against Cargo version
         run: |
           $ErrorActionPreference = 'Stop'
